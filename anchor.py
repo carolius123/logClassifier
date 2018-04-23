@@ -92,7 +92,7 @@ class Anchor(object):
 
 
 if __name__ == '__main__':
-    a = Anchor('E:\\data\\inputs\\10.21.84.7\\data\\tmp\\upload_00027669.tmp')
+    a = Anchor('/root/suihf/data/inputs/10.20.100.10/logs/err.log')
     b= a.name
     b = ((0, 'DATE_TIME'), [1001, {'17-12-28-0-0'}, 19])
     a.setFormat(b)
