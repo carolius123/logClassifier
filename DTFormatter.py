@@ -8,13 +8,17 @@
 #
 
 import re
-from collections import Counter
 import time
+
 import numpy as np
+
 from config import Workspaces as G
 
 
 class Anchor(object):
+    """
+
+    """
     __MonthRegex = re.compile(r'(?<=\W)(Jan)|(Feb)|(Mar)|(Apr)|(May)|(Jun|June)|(Jul|July)|(Aug)|(Sep|Sept)'
                               r'|(Oct)|(Nov)|(Dec)(?=\W)', re.I)
     __time_regex = r'(\d|[01]\d|2[0-3]):(\d|[0-5]\d):(\d|[0-5]\d)(am|pm)?(?![\d:])'
@@ -54,6 +58,12 @@ class Anchor(object):
     # 从字符串line中抽取第一和最后时间戳，追加到match_groups
     @classmethod
     def appendAnchors( cls, line, anchors ):
+        """
+
+        :param line:
+        :param anchors:
+        :return:
+        """
         line_ = cls.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex), line)  # 短语月份转为数字, 如Jan-〉1
         first_, last_ = None, None
         matches_ = [v for v in cls.__DateTimeRegExp.finditer(line_)]
@@ -75,6 +85,12 @@ class Anchor(object):
     # 统计得到最佳Anchor
     @staticmethod
     def statsAnchors( anchors, lines ):
+        """
+
+        :param anchors:
+        :param lines:
+        :return:
+        """
         anchors = sorted(anchors.items(), key=lambda d: d[1][0], reverse=True)
         G.log.debug('Candidate anchors detected at(col:freq) %s',
                     ', '.join(['%s(%d:%d)' % (k[1], k[0], v[0]) for k, v in anchors]))
@@ -84,6 +100,12 @@ class Anchor(object):
 
     # 跟据日志中日期变化规律(先日再月后年)，确定日期格式
     def setFormat( self, anchor, filename='' ):
+        """
+
+        :param anchor:
+        :param filename:
+        :return:
+        """
         (start_, name_), (amount_, date_set, stop_) = anchor
 
         # 考虑时间戳前后可能有变长变量(如INFO，CRITICAL等），给起止位置留一定余量(前后5个字符）
@@ -161,6 +183,11 @@ class Anchor(object):
 
     # 返回锚点的时间戳值，如不存在，返回None
     def getAnchorTimeStamp( self, line ):
+        """
+
+        :param line:
+        :return:
+        """
         if self.dtRegExp is None:
             raise UserWarning('Failed to getAnchorTimeStamp: Anchor is not initialized!')
 

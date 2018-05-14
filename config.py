@@ -5,14 +5,23 @@
 # @Date  : 2017/12/28
 # @Desc  : 读取配置文件、初始化工作目录、日志设置，生成cfg、log全局对象
 #
+"""
+Initialize log setting, working folders, and set global variables
+"""
 
 import logging
+import sys
 from configparser import ConfigParser
 from os import path, mkdir
 from platform import system
 
+from sklearn.externals import joblib
+
 
 class Workspaces(object):
+    """
+    设置日志和全局变量
+    """
     # 初始化类变量
     cfg = ConfigParser()
     cfg.read('./config.ini', encoding='UTF-8')
@@ -20,18 +29,39 @@ class Workspaces(object):
     # 赋值并初始化各类工作目录
     __workspace = cfg.get('General', 'Workspace')  # 数据处理的工作目录
     logsPath = path.join(__workspace, 'logs')  # 运行日志
-    inputs = path.join(__workspace, 'inputs')  # 原始样本文件应保存在该目录及下级子目录中
+    inbox = path.join(__workspace, 'inbox')  # 原始压缩样本文件应上传至该目录中
+    l0_inputs = path.join(__workspace, 'l0inputs')  # 原始样本文件应保存在该目录及下级子目录中
     l1_cache = path.join(__workspace, 'l1cache')  # 某进程生成的多个日志文件合并后保存在该目录及下级子目录中
     l2_cache = path.join(__workspace, 'l2cache')  # 同类日志文件合并后保存在该目录下
-    models = path.join(__workspace, cfg.get('General', 'SiteID') + cfg.get('General', 'Version'))  # 保存生成的最终及中间模型及配置文件
+    product_model = path.join(__workspace, cfg.get('General', 'ProductID'))  # 保存产品及通用模型数据
+    project_model = path.join(__workspace, cfg.get('General', 'ProjectID'))  # 保存生成的最终及中间模型及配置文件
     outputs = path.join(__workspace, 'outputs')  # 保存输出数据文件
 
-    for __folder in [logsPath, inputs, l1_cache, l2_cache, models, outputs]:
+    for __folder in [logsPath, inbox, l0_inputs, l1_cache, l2_cache, product_model, project_model, outputs]:
         if not path.exists(__folder):
             mkdir(__folder)
 
-    # 赋值各类文件路径
-    l2FilesList = path.join(models, 'l2file_info.csv')  # l2_cache中文件的元数据：包括文件名称、定界时间位置、日志类型等
+    same_anchor_width = cfg.getint('General', 'SameAnchorWidth')
+    last_update_seconds = cfg.getint('Classifier', 'LastUpdateHours') * 3600
+    '''
+    fileDescriptor文件保存如下列表: [[l0_filenames], [fd_origin], [fd_common], [fd_category]]. 其中,
+        l0_filenames 是$l0_input中所有文件全路径名列表, 目录分割符为/
+        fd_origin = [ori_name, gather_time, last_update_time, ori_size] 在被管服务器上的全路径名,采集时间等
+        fd_common = [common_name, anchor] 在$l1_cache中全路径名(去掉数字后合并的文件)
+        fd_category = [category_name, confidences, distances] 分类, 置信度和中心距离
+    '''
+    fileDescriptor = path.join(project_model, 'FileDescriptor.dbf')  # 样本文件描述信息
+    fd_origin_none = ['', 0, -last_update_seconds * 2, 0]  # [ori_name, gather_time, last_update_time, ori_size]
+    fd_common_none = ['', '']  # [common_name, anchor]
+    fd_category_none = ['', 0, 0]  # [category_name, confidences, distances]
+
+    @classmethod
+    def loadFds(cls):
+        return [[], [], [], []] if not path.exists(cls.fileDescriptor) else joblib.load(cls.fileDescriptor)
+
+    fileClassifierModel = path.join(project_model, 'FileClassifier.Model')
+
+    l2FilesList = path.join(project_model, 'l2file_info.csv')  # l2_cache中文件的元数据：包括文件名称、定界时间位置、日志类型等
 
     win = (system() == 'Windows')  # 本机操作系统类型，用于处理路径分隔符等Win/Unix的差异
 
@@ -39,9 +69,13 @@ class Workspaces(object):
     log = logging.getLogger() if cfg.getboolean('General', 'IncludeLibs') else logging.getLogger('classifier')
     logLevel = cfg.getint('General', 'LogLevel')
     log.setLevel(logLevel)
-    for __Handler in cfg.get('General', 'Handlers').split():
-        __formatter = logging.Formatter('%(asctime)s\t%(levelno)s\t%(filename)s %(lineno)d\t%(message)s')
-        __fh = logging.StreamHandler() if __Handler == 'STDOUT' else logging.FileHandler(path.join(logsPath, __Handler))
+    __formatter = logging.Formatter('%(asctime)s\t%(levelname)s\t%(filename)s %(lineno)d\t%(message)s')
+    __fh = logging.FileHandler(path.join(logsPath, path.splitext(path.split(sys.argv[0])[1])[0]) + '.log',
+                               encoding='GBK')
+    __fh.setFormatter(__formatter)
+    log.addHandler(__fh)
+    if cfg.getboolean('General', 'StdOut'):
+        __fh = logging.StreamHandler()
         __fh.setFormatter(__formatter)
         log.addHandler(__fh)
     log.debug("stared!")
@@ -49,7 +83,12 @@ class Workspaces(object):
     # 对一个样本(字符串)进行处理，返回词表[word]
     @classmethod
     def getWords( cls, document, rule_set ):
+        """
 
+        :param document:
+        :param rule_set:
+        :return:
+        """
         # 按照replace_rules对原文进行预处理，替换常用变量，按标点拆词、滤除数字等等
         keep_words = []
         for (replace_from, replace_to) in rule_set[1]:
@@ -76,3 +115,4 @@ class Workspaces(object):
 
         # 合并返回单词列表
         return keep_words + k_shingles
+

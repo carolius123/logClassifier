@@ -24,23 +24,28 @@
 3.4 数字变量中可能包含时长、数量等指标数据，可考虑提取和利用的手段
 """
 
-import numpy as np
-import re
 import os
-from time import localtime, strftime
-from tempfile import NamedTemporaryFile, TemporaryFile
-from pandas import DataFrame
+import re
 from collections import Counter
-from config import Workspaces as G
-from anchor import Anchor
+from tempfile import NamedTemporaryFile, TemporaryFile
+from time import localtime, strftime
+
+import numpy as np
 from gensim.corpora import Dictionary
 from gensim.models import TfidfModel
+from pandas import DataFrame
 from sklearn.cluster import KMeans
 from sklearn.externals import joblib
+
+from anchor import Anchor
+from config import Workspaces as G
 
 
 # 对一个数千到数十万行的文件中的记录进行聚类，形成聚类模型
 class Categorizer(object):
+    """
+
+    """
     __RuleSets = []  # 文本处理的替换、停用词和k-shingle规则
     for rule_section in sorted([section for section in G.cfg.sections() if section.split('-')[0] == 'RuleSet']):
         replace_rules, stop_words, k_list = [], [], []
@@ -77,7 +82,7 @@ class Categorizer(object):
             if not os.path.exists(model_file):
                 model_file += '.mdl'
                 if not os.path.exists(model_file):
-                    model_file = os.path.join(G.models, model_file)
+                    model_file = os.path.join(G.project_model, model_file)
             model = joblib.load(model_file)
             self.__anchor = model[0]  # 时间戳锚点Anchor
             self.__ruleSet = model[1]  # 处理文件正则表达式
@@ -92,6 +97,11 @@ class Categorizer(object):
 
     # 训练、生成模型并保存在$models/xxx.mdl中,dataset:绝对/相对路径样本文件名，或者可迭代样本字符流
     def trainModel( self, dataset, anchor=None ):
+        """
+
+        :param dataset:
+        :param anchor:
+        """
         samples_file, temple_fp = self.__buildSamplesFile(dataset)  # 获得有效的样本文件名称
         if anchor is None:  # 从样本文件中提取时间戳锚点
             self.__anchor = Anchor(samples_file)
@@ -112,7 +122,7 @@ class Categorizer(object):
             self.__k, self.__a, self.__p, self.__b, self.__q = self.__buildClusterModel(preferred_k, vectors)
 
             joblib.dump((self.__anchor, self.__ruleSet, self.__d, self.__k, self.__a, self.__p,
-                         self.__b, self.__q), os.path.join(G.models, samples_file + '.mdl'))  # 保存模型，供后续使用
+                         self.__b, self.__q), os.path.join(G.project_model, samples_file + '.mdl'))  # 保存模型，供后续使用
 
             self.__d.save_as_text(os.path.join(G.logsPath, samples_file + '.dic.csv'))  # 保存文本字典，供人工审查
 
@@ -125,7 +135,7 @@ class Categorizer(object):
             df = DataFrame({'类型名称': a[1], '置信度': a[2], '时间': date_time, '记录内容': a[4], '记录词汇': a[5]})
             df.to_csv(os.path.join(G.logsPath, os.path.split(samples_file)[1] + '.out.csv'), index=False, sep='\t')
 
-            G.log.info('Model saved to %s successful.' % os.path.join(G.models, samples_file + '.mdl'))
+            G.log.info('Model saved to %s successful.' % os.path.join(G.project_model, samples_file + '.mdl'))
             break
         else:
             raise UserWarning('Cannot generate qualified corpus by all RuleSets')
@@ -336,6 +346,11 @@ class Categorizer(object):
     # predict from file or list of lines，返回“类别id、名称，记录的置信度、时间戳、原文和词表”的列表
     # 置信度最大99.99，如>1, 表示到中心点距离小于0.8分位点，非常可信；最小-99.99，如< 0距离大于最远点，意味着不属于此类
     def predict( self, dataset ):
+        """
+
+        :param dataset:
+        :return:
+        """
         if self.__k is None:
             raise UserWarning('Failed to predict: Model is not exist!')
 
