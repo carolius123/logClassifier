@@ -8,6 +8,8 @@
 
 import os
 import re
+import shutil
+import time
 from collections import Counter
 
 import numpy as np
@@ -18,8 +20,8 @@ from scipy.signal import argrelextrema
 from sklearn.cluster import KMeans
 from sklearn.externals import joblib
 
-from anchor import Anchor
 from config import Workspaces as G
+from utilites import Util
 
 
 # 对数十、上百万个文件进行聚类，形成聚类模型
@@ -30,33 +32,75 @@ class Classifier(object):
     $DATA/models/l1file_info.csv：记录原始样本文件信息(暂时不要？）
     $DATA/l1cache/: 存储各样本文件。目录结构就是被管服务器原始结构
     """
-    __corpusCacheFile = os.path.join(G.project_model, 'corpuscache.1')
-    l1_dbf = os.path.join(G.project_model, 'metadata.1')
+    __corpusCacheFile = os.path.join(G.projectModelPath, 'corpuscache.1')
+    l1_dbf = os.path.join(G.projectModelPath, 'metadata.1')
     __MaxLines = G.cfg.getint('Classifier', 'MaxLines')
-    __FileMergePattern = re.compile(G.cfg.get('Classifier', 'FileMergePattern'))
-    __FileCheckPattern = re.compile(G.cfg.get('Classifier', 'FileCheckPattern'))
 
-    def __init__(self, dataset_path=None, model_file=None):
+    def __init__(self, model_file=''):
+        self.model_file = model_file
+        self.model_id = 0 if model_file == G.productFileClassifierModel else 1
         self.common_filenames, self.l1_structure = ([], [])
-
         self.ruleSet = None  # 处理文件正则表达式
         self.statsScope = None  # 样本文件字符数、字数统计值(均值、标准差、中位数)的最小-最大值范围
         self.dictionary = None  # 字典对象(Gensim Dictionary)
         self.model = None  # 聚类模型(Kmeans)
         self.categories = None  # 聚类的类型(名称，数量占比，分位点距离，边界点距离)
 
-        if model_file:  # 从模型文件装载模型
-            if not os.path.exists(model_file):
-                model_file = os.path.join(G.project_model, model_file)
+        if os.path.exists(model_file):  # 从模型文件装载模型
             self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories = joblib.load(model_file)
-        elif dataset_path:  # 从样本训练模型
-            self.fds = G.loadFds()  # 装载文件描述信息
-            self.__preMerge(dataset_path)
-            results = self.trainModel(k_=156)
-            self.__saveModel()  # 保存文本信息，供人工审查
-            classified_files, _ = self.__saveResults(results)
-            self.__postMerge(classified_files, G.l2_cache)  # 同类文件合并到to_目录下
-            self.__genGatherList(classified_files)  # 生成采集文件列表
+        else:
+            G.log.warning('No model loaded!')
+
+    # 重新训练模型
+    def reCluster(self):
+        for folder in [G.l1_cache, G.l2_cache, G.outputs]:
+            if os.path.exists(folder):
+                shutil.rmtree(folder)
+        time.sleep(3)
+        for folder in [G.l1_cache, G.l2_cache, G.outputs]:
+            os.mkdir(folder)
+
+        common_files, file2merged = Util.mergeFilesByName(G.l0_inputs, G.l1_cache)
+        self.__dbFilesSampled(file2merged)
+        results = self.trainModel(k_=35)
+        self.__saveModel()  # model saved to file
+
+        Util.clearModel(self.model_id)
+        self.dbUpdCategories()
+
+        db = Util.dbConnect()
+        if not db:
+            return
+        cursor = db.cursor()
+        classified_common_files, unclassified_common_files = self.splitResults(results)
+        Util.dbFilesMerged(cursor, file2merged, classified_common_files, unclassified_common_files)
+        Util.mergeFilesByClass(cursor, G.l2_cache)  # 同类文件合并到to_目录下
+        wildcard_log_files = Util.genGatherList(cursor)  # 生成采集文件列表
+        Util.dbWildcardLogFiles(cursor, wildcard_log_files)
+        db.commit()
+        db.close()
+
+    def __dbFilesSampled(self, file2merged):
+        db = Util.dbConnect()
+        if not db:
+            return
+        cursor = db.cursor()
+        for file_fullname, anchor_name, anchor_colRange, common_file_fullname in file2merged:
+            file_fullname = file_fullname.replace('\\', '/')
+            host = file_fullname[len(G.l0_inputs):].strip('/')
+            host, filename = host.split('/', 1)
+            archive_path, filename = os.path.split(filename)
+            remote_path = '/' + archive_path if archive_path[1] != '_' else archive_path[0] + ':' + archive_path[2:]
+            host = '"%s"' % host.strip('/')
+            archive_path = '"%s"' % archive_path
+            remote_path = '"%s"' % remote_path
+            file_fullname = '"%s"' % file_fullname
+            filename = '"%s"' % filename
+            sql = 'INSERT INTO files_sampled (file_fullname,host,archive_path,filename,remote_path) VALUES(%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE file_fullname=%s' % (
+                file_fullname, host, archive_path, filename, remote_path, file_fullname)
+            cursor.execute(sql)
+        db.commit()
+        db.close()
 
     def __iter__(self):
         self.category_id = 0
@@ -85,87 +129,20 @@ class Classifier(object):
         if name in self.categories[0]:
             raise ValueError
         self.categories[0][key] = name
+        self.dbUpdCategories()
 
-    # 预处理，from_下同目录、文件名相似(滤除数字后相同)的合并，连带目录结构输出到to_.
-    def __preMerge(self, from_=G.l0_inputs, to_=G.l1_cache):
-        G.log.info('Start probing %s, merging into %s', from_, to_)
-        fc = {'from': 0, 'qualified': 0, 'to': 0}
-        processed_files = os.path.join(G.project_model, 'preProcess.dbf')
-        processed = [] if not os.path.exists(processed_files) else joblib.load(processed_files)
-
-        for dir_path, dir_names, file_names in os.walk(from_):
-            # 形成文件描述列表:'filename', 'fds_idx', 'm_time', 'common_name', 'anchor'
-            file_descriptors = pd.DataFrame(columns=('filename', 'fds_idx', 'm_time',
-                                                     'common_name', 'anchor_name', 'anchor_colRange'))
-            for idx, filename in enumerate(file_names):
-                file_fullname = os.path.join(dir_path, filename).replace('\\', '/')
-
-                # 跳过上次处理过的文件
-                processing_file = file_fullname + '\t' + str(os.path.getmtime(file_fullname))
-                if processing_file in processed:
-                    continue
-                fc['from'] += 1
-                processed.append(processing_file)
-
-                # 计算时间戳锚点, 滤掉没有锚点的文件
-                try:
-                    anchor = Anchor(file_fullname)
-                except Exception as err:
-                    G.log.warning('Failed to process\t%s, ignored.\t%s', file_fullname, str(err))
-                    continue
-
-                # 检索fds中对应文件的元数据, 计算common name
-                fds_idx, m_time = -1, 0
-                if file_fullname in self.fds[0]:
-                    fds_idx = self.fds[0].index(file_fullname)
-                    m_time = self.fds[1][fds_idx][2]
-                common_name = self.__FileMergePattern.sub('', os.path.splitext(filename)[0])  # 计算切分日志的公共文件名
-                if not common_name:
-                    common_name = 'digital1'
-
-                # 添加到file_descriptors中
-                file_descriptors.loc[idx] = file_fullname, fds_idx, m_time, common_name, anchor.name, anchor.colRange
-
-            if len(file_descriptors) == 0:  # 无有效日志文件
-                continue
-            path_to = dir_path.replace(from_, to_)
-            os.makedirs(path_to, exist_ok=True)  # 按需建立目标目录
-
-            file_descriptors.sort_values('m_time')  # 按最后更新时间排序,以便顺序合并
-            # 同目录内名称相似的文件分为一组
-            for k_, v_ in file_descriptors.groupby(['anchor_name', 'common_name']):
-                if fc['qualified'] % 500 == 0:
-                    G.log.info('%d files probed and merged, %s', fc['qualified'], dir_path)
-                # 同组文件合并为1个
-                common_file_fullname = os.path.join(path_to, '-'.join(k_))
-                with open(common_file_fullname, 'a', encoding='utf-8') as fp:
-                    fc['to'] += 1
-                    # 合并文件,保存元数据
-                    for file_fullname, fds_idx, anchor_name, anchor_colRange in zip(
-                            v_['filename'], v_['fds_idx'], v_['anchor_name'], v_['anchor_colRange']):
-                        try:
-                            for line in open(file_fullname, 'r', encoding='utf-8'):
-                                fp.write(line)
-
-                            fc['qualified'] += 1
-                            anchor_info = '%s:%d:%d' % (anchor_name, anchor_colRange[0], anchor_colRange[1])
-                            fd_common = [common_file_fullname, anchor_info]
-                            if fds_idx != -1:
-                                self.fds[2][fds_idx] = fd_common
-                            else:
-                                self.fds[0].append(file_fullname)
-                                self.fds[1].append(G.fd_origin_none)
-                                self.fds[2].append(fd_common)
-                                self.fds[3].append(G.fd_category_none)
-
-                        except Exception as err:
-                            G.log.warning('Failed to merge %s, ignored. %s', file_fullname, str(err))
-                            continue
-        if fc['from']:
-            joblib.dump(self.fds, G.fileDescriptor)
-            joblib.dump(processed, processed_files)
-        G.log.info('probed %d files, %d qualified, merged into %d', fc['from'], fc['qualified'], fc['to'])
-        return fc['to']
+    def dbUpdCategories(self):
+        db = Util.dbConnect()
+        if db:  # Can't connect ro db, waiting and retry forever
+            cursor = db.cursor()
+            c = self.categories
+            for category_id, (name, percent, boundary, quantile) in enumerate(zip(c[0], c[1], c[2], c[3])):
+                name = '"%s"' % name
+                sql = 'INSERT INTO file_class (model_id, category_id, name, quantile, boundary, percent) VALUES(%d, %d, %s, %e,%e, %f) ON DUPLICATE KEY UPDATE name=%s,quantile=%e,boundary=%e,percent=%f' % (
+                    self.model_id, category_id, name, quantile, boundary, percent, name, quantile, boundary, percent)
+                cursor.execute(sql)
+            db.commit()
+        db.close()
 
     # 训练、生成模型并保存在$models/xxx.mdl中,dataset:绝对/相对路径样本文件名，或者可迭代样本字符流
     def trainModel(self, dataset_path=G.l1_cache, k_=0):
@@ -264,7 +241,7 @@ class Classifier(object):
         amount_files, failed_files, file_fullname = 0, 0, ''
         G.log.info('Start Converting documents from ' + dataset_path)
 
-        processed_files = os.path.join(G.project_model, 'buildDocument.dbf')
+        processed_files = os.path.join(G.projectModelPath, 'buildDocument.dbf')
         processed = [] if not os.path.exists(processed_files) else joblib.load(processed_files)
 
         for dir_path, dir_names, file_names in os.walk(dataset_path):
@@ -338,7 +315,8 @@ class Classifier(object):
         subtotal = l1_fd[:, 7:] * 0.005  # subtotal 12列各占0.5%左右权重
 
         cols += len(self.l1_structure[0])
-        G.log.info('[%d*%d]Vectors built' % (rows, cols))
+        if rows > 300:
+            G.log.info('[%d*%d]Vectors built' % (rows, cols))
 
         return np.hstack((statistics, subtotal, vectors))
 
@@ -465,134 +443,25 @@ class Classifier(object):
     # 保存文本格式模型
     def __saveModel(self):
         joblib.dump((self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories),
-                    G.fileClassifierModel)
+                    G.projectFileClassifierModel)
         self.dictionary.save_as_text(os.path.join(G.logsPath, 'FileDictionary.csv'))
         category_names, percents, boundaries, quantiles = self.categories
         l2_fd = pd.DataFrame({'类名': category_names, '占比': percents,
                               '分位点到边界': quantiles, '边界点': boundaries})
         l2_fd.to_csv(os.path.join(G.logsPath, 'FileCategories.csv'), sep='\t', encoding='GBK')
-        G.log.info('Model is built and saved to %s, %s: FileDictionary.csv, FileCategories.csv successful.',
-                   G.fileClassifierModel, G.logsPath)
+        G.log.info(
+            'Model is built and saved to %s, %s and Database: FileDictionary.csv, FileCategories.csv successful.',
+            G.projectFileClassifierModel, G.logsPath)
 
-    def __saveResults(self, results):
-        categories, category_names, confidences, distances = results  # 预测分类并计算可信度
-        min_confidence = G.cfg.getfloat('Classifier', 'MinConfidence')
-        classified_files = pd.DataFrame(columns=('path', 'name', 'common_name', 'c_id', 'c_name', 'confidence',
-                                                 'ori_name', 'seconds_ago', 'anchor'))
-        un_classified_files = classified_files.copy()
-        for fd_idx, (l0_filenames, [ori_name, gather_time, last_update_time, _], [common_name, anchor]) \
-                in enumerate(zip(self.fds[0], self.fds[1], self.fds[2])):
-
-            confidence, category_id, category_name = -99, -1, -1
-            if common_name:
-                l1_idx = self.common_filenames.index(common_name)  # 找到common文件分类的索引
-                fd_category = [category_names[l1_idx], confidences[l1_idx], distances[l1_idx]]
-                self.fds[3][fd_idx] = fd_category  # 更新fds的分类信息
-                confidence, category_name = confidences[l1_idx], category_names[l1_idx]
-                category_id = self.categories[0].index(category_name)
-
-            path_, l0_name = os.path.split(l0_filenames)
-            l1_name = os.path.split(common_name)[1]
-            seconds_ago = gather_time - last_update_time
-            item_ = path_, l0_name, l1_name, category_id, category_name, confidence, ori_name, seconds_ago, anchor
-            if confidence < min_confidence:
-                un_classified_files.loc[fd_idx] = item_
+    def splitResults(self, results):
+        classified_files, unclassified_files = [], []
+        for common_name, category, category_name, confidence, distance in zip(self.common_filenames, results[0],
+                                                                              results[1], results[2], results[3]):
+            if confidence < G.minConfidence:  # 置信度不够,未完成分类
+                unclassified_files.append(common_name)
             else:
-                classified_files.loc[fd_idx] = item_
-
-        joblib.dump(self.fds, G.fileDescriptor)
-        classified_files.to_csv(os.path.join(G.logsPath, 'ClassifiedFiles.csv'), sep='\t', encoding='GBK')
-        un_classified_files.to_csv(os.path.join(G.logsPath, 'unClassifiedFiles.csv'), sep='\t', encoding='GBK')
-        G.log.info('result saved to %s:ClassifiedFiles.csv, unClassifiedFiles.csv', G.logsPath)
-        return classified_files, un_classified_files
-
-    # 同类文件合并到to_目录下，供后续记录聚类使用
-    @staticmethod
-    def __postMerge(classified_files, to_):
-        c = [0, 0, 0]  # counter
-        for c_id, group in classified_files.groupby(['c_id']):
-            file_to = os.path.join(to_, 'fc%d' % c_id)  # 以类别名称作为输出文件名称
-            group.sort_values(by=['seconds_ago'])
-            with open(file_to, 'w', encoding='utf-8') as fp:
-                c[2] += 1
-                for path_, f in zip(group['path'], group['name']):
-                    file_from = os.path.join(path_, f)
-                    try:
-                        for line in open(file_from, 'r', encoding='utf-8'):
-                            fp.write(line)
-                        c[0] += 1
-                        G.log.debug('%s merged into %s', file_from, file_to)
-                    except Exception as err:
-                        c[1] += 1
-                        G.log.warning('Failed to merge %s, ignored. %s', file_from, str(err))
-                        continue
-        G.log.info('%d files(%d errors) merged into %d sample files, stored into %s', c[0], c[1], c[2], to_)
-
-    # 识别切分日志, 形成应采文件的列表.
-    def __genGatherList(self, classified_files):
-        """
-        切分日志包括定时归档、定长循环、定时新建3种情况，定时归档日志只需采集最新文件，定长循环、定时新建日志当作1个
-        数据流处理, 采集日期最新的,如一段时间未更新, 则试图切换到更新的采集.
-        """
-        log_flows = pd.DataFrame(columns=('host', 'path', 'wildcard_name', 'match_key'))
-        log_flows_idx = 0
-        for _, cp_group in classified_files.groupby(['c_id', 'path']):  # 同目录, 同类文件
-            num_common_names = len(cp_group.groupby(['common_name']))
-            differences = [len(self.__FileCheckPattern.findall(name)) for name in cp_group['name']]
-            special_files = differences.count(min(differences))  # 不是通常归档文件的文件数量
-            if num_common_names == 2 and special_files > 1 or num_common_names > 2:  # 同目录下多组日志文件, 进一步拆分
-                cp_groups = [c for _, c in cp_group.groupby(['common_name'])]
-            else:
-                cp_groups = [cp_group]
-
-            for cp_group in cp_groups:
-                cp_group.sort_values(by=['seconds_ago', 'name'])
-                path_, filename, _, category_id, _, _, ori_name, seconds_ago, anchor = cp_group.iloc[0]
-                if seconds_ago > G.last_update_seconds:  # 最新的文件长期未更新,不用采
-                    continue
-                # 取hostname
-                file_fullname = os.path.join(path_, filename).replace('\\', '/')
-                host = file_fullname[len(G.l0_inputs):].strip('/')
-                if not ori_name:
-                    ori_name = host.split('/', 1)[1]
-                host = host[:len(host) - len(ori_name)].strip('/')
-                ori_path = os.path.split(ori_name)[0]
-                match_key = '%d:%d:%s' % (log_flows_idx, category_id, anchor)
-
-                if len(cp_group) == 1:  # 仅有一个有效文件
-                    log_flows.loc[log_flows_idx] = host, ori_path, filename, match_key
-                    log_flows_idx += 1
-                    continue
-
-                differences = [len(self.__FileCheckPattern.findall(name)) for name in cp_group['name']]  # 文件名不同部分的长度
-                min_len, max_len = min(differences), max(differences)
-                min_files = differences.count(min_len)
-                files = list(cp_group['name'])
-                if min_files == len(differences):  # 定时新建(所有文件名同样长): 通配符采集
-                    filename = self.__FileCheckPattern.sub('?', files[0])
-                elif max_len - min_len < 3:  # 定长归档(长度差不超过2).共同前缀作为通配符
-                    filename = self.common_prefix(files)
-                else:  # 其他情况为定期归档, 采集最新的特别文件
-                    pass
-
-                log_flows.loc[log_flows_idx] = host, ori_path, filename, match_key
-                log_flows_idx += 1
-
-        log_flows.to_csv(os.path.join(G.outputs, 'gatherlist.csv'), sep='\t', encoding='GBK')
-        return log_flows
-
-    # 计算字符串数组的公共前缀
-    @staticmethod
-    def common_prefix(str_list):
-        str_lens = [len(str_) for str_ in str_list]
-        shortest_len = min(str_lens)
-        shortest_idx = str_lens.index(shortest_len)
-        compared_idx = 0 if shortest_idx else 1
-        shortest, compared = str_list[shortest_idx], str_list[compared_idx]
-        for i in range(shortest_len, 0, -1):
-            if shortest[:i] == compared[:i]:
-                break
-        return shortest[:i] + '*'
+                classified_files.append([self.model_id, common_name, category, category_name, confidence, distance])
+        return classified_files, unclassified_files
 
     # 对单个样本文件进行分类，返回文件名称、时间戳锚点位置，类别和置信度
     def predictFile(self, file_fullname, encoding='utf-8'):
@@ -608,10 +477,9 @@ class Classifier(object):
 
         try:
             document = self.__file2doc(file_fullname, encoding=encoding)  # 文件转为词表
-            file = self.common_filenames[-1]
             vectors = self.__buildVectors([document], 1)
             categories, names, confidences, distances = self.__getResult(vectors)  # 预测分类并计算可信度
-            return file, categories[0], names[0], confidences[0], distances[0]
+            return categories[0], names[0], confidences[0], distances[0]
 
         except Exception as err:
             G.log.warning('Failed to predict\t%s, ignored.\t%s', file_fullname, str(err))
@@ -683,7 +551,8 @@ class Classifier(object):
 
 
 if __name__ == '__main__':
-    lc = Classifier(G.l0_inputs)
     lc = Classifier()
+    lc.reCluster()
+
     #    lc.trainModel(G.l1_cache)
     x = 1

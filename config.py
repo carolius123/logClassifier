@@ -10,12 +10,11 @@ Initialize log setting, working folders, and set global variables
 """
 
 import logging
+import os
+import re
 import sys
 from configparser import ConfigParser
-from os import path, mkdir
 from platform import system
-
-from sklearn.externals import joblib
 
 
 class Workspaces(object):
@@ -28,18 +27,18 @@ class Workspaces(object):
 
     # 赋值并初始化各类工作目录
     __workspace = cfg.get('General', 'Workspace')  # 数据处理的工作目录
-    logsPath = path.join(__workspace, 'logs')  # 运行日志
-    inbox = path.join(__workspace, 'inbox')  # 原始压缩样本文件应上传至该目录中
-    l0_inputs = path.join(__workspace, 'l0inputs')  # 原始样本文件应保存在该目录及下级子目录中
-    l1_cache = path.join(__workspace, 'l1cache')  # 某进程生成的多个日志文件合并后保存在该目录及下级子目录中
-    l2_cache = path.join(__workspace, 'l2cache')  # 同类日志文件合并后保存在该目录下
-    product_model = path.join(__workspace, cfg.get('General', 'ProductID'))  # 保存产品及通用模型数据
-    project_model = path.join(__workspace, cfg.get('General', 'ProjectID'))  # 保存生成的最终及中间模型及配置文件
-    outputs = path.join(__workspace, 'outputs')  # 保存输出数据文件
+    logsPath = os.path.join(__workspace, 'logs')  # 运行日志
+    inbox = os.path.join(__workspace, 'inbox')  # 原始压缩样本文件应上传至该目录中
+    l0_inputs = os.path.join(__workspace, 'l0inputs')  # 原始样本文件应保存在该目录及下级子目录中
+    l1_cache = os.path.join(__workspace, 'l1cache')  # 某进程生成的多个日志文件合并后保存在该目录及下级子目录中
+    l2_cache = os.path.join(__workspace, 'l2cache')  # 同类日志文件合并后保存在该目录下
+    productModelPath = os.path.join(__workspace, cfg.get('General', 'ProductID'))  # 保存产品及通用模型数据
+    projectModelPath = os.path.join(__workspace, cfg.get('General', 'ProjectID'))  # 保存生成的最终及中间模型及配置文件
+    outputs = os.path.join(__workspace, 'outputs')  # 保存输出数据文件
 
-    for __folder in [logsPath, inbox, l0_inputs, l1_cache, l2_cache, product_model, project_model, outputs]:
-        if not path.exists(__folder):
-            mkdir(__folder)
+    for __folder in [logsPath, inbox, l0_inputs, l1_cache, l2_cache, productModelPath, projectModelPath, outputs]:
+        if not os.path.exists(__folder):
+            os.mkdir(__folder)
 
     same_anchor_width = cfg.getint('General', 'SameAnchorWidth')
     last_update_seconds = cfg.getint('Classifier', 'LastUpdateHours') * 3600
@@ -50,18 +49,17 @@ class Workspaces(object):
         fd_common = [common_name, anchor] 在$l1_cache中全路径名(去掉数字后合并的文件)
         fd_category = [category_name, confidences, distances] 分类, 置信度和中心距离
     '''
-    fileDescriptor = path.join(project_model, 'FileDescriptor.dbf')  # 样本文件描述信息
+    fileDescriptor = os.path.join(projectModelPath, 'FileDescriptor.dbf')  # 样本文件描述信息
     fd_origin_none = ['', 0, -last_update_seconds * 2, 0]  # [ori_name, gather_time, last_update_time, ori_size]
     fd_common_none = ['', '']  # [common_name, anchor]
     fd_category_none = ['', 0, 0]  # [category_name, confidences, distances]
 
-    @classmethod
-    def loadFds(cls):
-        return [[], [], [], []] if not path.exists(cls.fileDescriptor) else joblib.load(cls.fileDescriptor)
-
-    fileClassifierModel = path.join(project_model, 'FileClassifier.Model')
-
-    l2FilesList = path.join(project_model, 'l2file_info.csv')  # l2_cache中文件的元数据：包括文件名称、定界时间位置、日志类型等
+    productFileClassifierModel = os.path.join(productModelPath, 'FileClassifier.Model')
+    projectFileClassifierModel = os.path.join(projectModelPath, 'FileClassifier.Model')
+    fileMergePattern = re.compile(cfg.get('Classifier', 'FileMergePattern'))
+    fileCheckPattern = re.compile(cfg.get('Classifier', 'FileCheckPattern'))
+    minConfidence = cfg.getfloat('Classifier', 'MinConfidence')
+    l2FilesList = os.path.join(projectModelPath, 'l2file_info.csv')  # l2_cache中文件的元数据：包括文件名称、定界时间位置、日志类型等
 
     win = (system() == 'Windows')  # 本机操作系统类型，用于处理路径分隔符等Win/Unix的差异
 
@@ -70,7 +68,7 @@ class Workspaces(object):
     logLevel = cfg.getint('General', 'LogLevel')
     log.setLevel(logLevel)
     __formatter = logging.Formatter('%(asctime)s\t%(levelname)s\t%(filename)s %(lineno)d\t%(message)s')
-    __fh = logging.FileHandler(path.join(logsPath, path.splitext(path.split(sys.argv[0])[1])[0]) + '.log',
+    __fh = logging.FileHandler(os.path.join(logsPath, os.path.splitext(os.path.split(sys.argv[0])[1])[0]) + '.log',
                                encoding='GBK')
     __fh.setFormatter(__formatter)
     log.addHandler(__fh)

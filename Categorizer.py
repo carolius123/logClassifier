@@ -4,25 +4,7 @@
 # @Author: Sui Huafeng
 # @Date  : 2018/3
 # @Desc  : 从$DATA/l2cache中每一个样本文件中训练一个日志记录分类器
-#    新建对象或者调用trainModel方法，可以生成Categorizer模型
-#    调用predict方法，可以预测新记录的类型及其置信度
-#    $DATA/models/l2file_info.csv：记录(\t分割)每个样本文件名称、定界符位置
-#    $DATA/l2cache/: 存储各样本文件。每个样本文件由同类日志原始样本合并而成
-#
-"""
-1. 日志文件中记录的识别。每条记录大都会在第一行特定位置输出日期和时间，因此以特定位置的时间戳(hh:mm:ss)判断上一记录
-   的结束和下一记录的开始
-2. 记录聚类的首要目标是把程序执行到某处输出的记录汇聚成一类。程序在某点输出日志，大致会包含几种信息：
-2.1 日期、时间等几乎所有记录都包含的共有信息：这些对聚类结果没有影响，不必单独考虑
-2.2 常数字符串和枚举型数据(如INFO、ERROR等): 这是这一类记录最典型的独有特征，应尽量突出其在聚类中的比重
-2.3 URL、IP、Java包、path等变量：应尽量识别出来并归一化成常数字符串，改善聚类效果
-2.4 字符串变量(应用系统的数据)和数字变量：上两类有效特征在每个记录中不会超过10个，字符串/数字变量可能会很多，这会严重
-     干扰聚类效果、影响运算速度，应尽量减少。数字可简单滤除。字符串变量可考虑去掉dfs字典中低频词
-3. 后续处理可能有价值的目标包括：
-3.1 数字变量中可能包含错误码、代码等高值信息，可考虑提取和利用的手段
-3.2 对于记录数特别多的类别(太粗),可根据枚举型、IP、URL、错误码等进一步细化分类
-3.4 数字变量中可能包含时长、数量等指标数据，可考虑提取和利用的手段
-"""
+
 
 import os
 import re
@@ -44,7 +26,22 @@ from config import Workspaces as G
 # 对一个数千到数十万行的文件中的记录进行聚类，形成聚类模型
 class Categorizer(object):
     """
-
+    新建对象或者调用trainModel方法，可以生成Categorizer模型
+    调用predict方法，可以预测新记录的类型及其置信度
+    $DATA/models/l2file_info.csv：记录(\t分割)每个样本文件名称、定界符位置
+    $DATA/l2cache/: 存储各样本文件。每个样本文件由同类日志原始样本合并而成
+    1. 日志文件中记录的识别。每条记录大都会在第一行特定位置输出日期和时间，因此以特定位置的时间戳(hh:mm:ss)判断上一记录
+       的结束和下一记录的开始
+    2. 记录聚类的首要目标是把程序执行到某处输出的记录汇聚成一类。程序在某点输出日志，大致会包含几种信息：
+    2.1 日期、时间等几乎所有记录都包含的共有信息：这些对聚类结果没有影响，不必单独考虑
+    2.2 常数字符串和枚举型数据(如INFO、ERROR等): 这是这一类记录最典型的独有特征，应尽量突出其在聚类中的比重
+    2.3 URL、IP、Java包、path等变量：应尽量识别出来并归一化成常数字符串，改善聚类效果
+    2.4 字符串变量(应用系统的数据)和数字变量：上两类有效特征在每个记录中不会超过10个，字符串/数字变量可能会很多，这会严重
+         干扰聚类效果、影响运算速度，应尽量减少。数字可简单滤除。字符串变量可考虑去掉dfs字典中低频词
+    3. 后续处理可能有价值的目标包括：
+    3.1 数字变量中可能包含错误码、代码等高值信息，可考虑提取和利用的手段
+    3.2 对于记录数特别多的类别(太粗),可根据枚举型、IP、URL、错误码等进一步细化分类
+    3.4 数字变量中可能包含时长、数量等指标数据，可考虑提取和利用的手段
     """
     __RuleSets = []  # 文本处理的替换、停用词和k-shingle规则
     for rule_section in sorted([section for section in G.cfg.sections() if section.split('-')[0] == 'RuleSet']):
@@ -82,7 +79,7 @@ class Categorizer(object):
             if not os.path.exists(model_file):
                 model_file += '.mdl'
                 if not os.path.exists(model_file):
-                    model_file = os.path.join(G.project_model, model_file)
+                    model_file = os.path.join(G.projectModelPath, model_file)
             model = joblib.load(model_file)
             self.__anchor = model[0]  # 时间戳锚点Anchor
             self.__ruleSet = model[1]  # 处理文件正则表达式
@@ -122,7 +119,7 @@ class Categorizer(object):
             self.__k, self.__a, self.__p, self.__b, self.__q = self.__buildClusterModel(preferred_k, vectors)
 
             joblib.dump((self.__anchor, self.__ruleSet, self.__d, self.__k, self.__a, self.__p,
-                         self.__b, self.__q), os.path.join(G.project_model, samples_file + '.mdl'))  # 保存模型，供后续使用
+                         self.__b, self.__q), os.path.join(G.projectModelPath, samples_file + '.mdl'))  # 保存模型，供后续使用
 
             self.__d.save_as_text(os.path.join(G.logsPath, samples_file + '.dic.csv'))  # 保存文本字典，供人工审查
 
@@ -135,7 +132,7 @@ class Categorizer(object):
             df = DataFrame({'类型名称': a[1], '置信度': a[2], '时间': date_time, '记录内容': a[4], '记录词汇': a[5]})
             df.to_csv(os.path.join(G.logsPath, os.path.split(samples_file)[1] + '.out.csv'), index=False, sep='\t')
 
-            G.log.info('Model saved to %s successful.' % os.path.join(G.project_model, samples_file + '.mdl'))
+            G.log.info('Model saved to %s successful.' % os.path.join(G.projectModelPath, samples_file + '.mdl'))
             break
         else:
             raise UserWarning('Cannot generate qualified corpus by all RuleSets')

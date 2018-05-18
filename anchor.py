@@ -41,15 +41,15 @@ class Anchor(object):
     def __getAnchor( cls, sample_file ):
         line_idx = 0
         anchors = {}  # 初始化潜在锚点字典
-        for line_idx, line in enumerate(open(sample_file, 'r', encoding='utf-8')):
-            try:
+        try:
+            for line_idx, line in enumerate(open(sample_file, 'r', encoding='utf-8')):
                 if cls.appendAnchors(line, anchors):  # 已经找够了时间戳锚点
                     break
                 if line_idx > 1000 and not anchors:  # 很多行都没找到时间戳
                     break
-            except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
-                G.log.warning('Line[%d] ignored due to the following error:', line_idx)
-                continue
+        except Exception as err:
+            G.log.warning('Line[%d] in %s ignored due to the following error:%s', line_idx, sample_file, str(err))
+
         return Anchor.statsAnchors(anchors, line_idx)
 
     @classmethod
