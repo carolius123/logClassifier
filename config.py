@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import sys
+# noinspection PyCompatibility
 from configparser import ConfigParser
 from platform import system
 
@@ -59,6 +60,9 @@ class Workspaces(object):
     fileMergePattern = re.compile(cfg.get('Classifier', 'FileMergePattern'))
     fileCheckPattern = re.compile(cfg.get('Classifier', 'FileCheckPattern'))
     minConfidence = cfg.getfloat('Classifier', 'MinConfidence')
+    maxClassifyLines = cfg.getint('Classifier', 'MaxLines')
+
+
     l2FilesList = os.path.join(projectModelPath, 'l2file_info.csv')  # l2_cache中文件的元数据：包括文件名称、定界时间位置、日志类型等
 
     win = (system() == 'Windows')  # 本机操作系统类型，用于处理路径分隔符等Win/Unix的差异

@@ -6,12 +6,13 @@
 # @Desc  : 定期扫描$data/inbox目录, 处理新上传的gz.tar样本文件
 
 import os
+import shutil
 import threading
 import time
 
 from Classifier import Classifier
 from config import Workspaces as G
-from utilites import Util
+from utilites import Dbc, FileUtil, DbUtil
 
 
 # extract and classify files from $data/inbox/*.tar.gz
@@ -25,25 +26,26 @@ class BatchJobService(object):
         for model_file in [G.productFileClassifierModel, G.projectFileClassifierModel]:
             if os.path.exists(model_file):
                 model = Classifier(model_file=model_file)
-                model.dbUpdCategories()
             else:
                 model = None
             self.models.append(model)
+
+        self.reInitialization()
 
         self.interval = G.cfg.getfloat('BatchJobService', 'IntervalMinutes') * 60
         self.db, self.cursor = None, None
         self.run()
 
     def run(self):
-        self.db = Util.dbConnect()
+        self.db = DbUtil.dbConnect()
         if not self.db:  # Can't connect ro db, schedule to next
             threading.Timer(self.interval, self.run).start()
         self.cursor = self.db.cursor()
-        self.processing()
+        self.classifyNewLogs()
         self.db.close()
         threading.Timer(self.interval, self.run).start()
 
-    def processing(self):
+    def classifyNewLogs(self):
         G.log.info('Extracting files from %s to %s', G.inbox, G.l0_inputs)
         for tar_file in os.listdir(G.inbox):
             if not tar_file.endswith('.tar.gz'):
@@ -52,27 +54,27 @@ class BatchJobService(object):
             extract_to, merge_to = os.path.join(G.l0_inputs, host), os.path.join(G.l1_cache, host)
             tar_file_fullname = os.path.join(G.inbox, tar_file)
             try:
-                Util.extractFile(tar_file_fullname, extract_to)  # 解压文件到当前目录
-                self.__dbFilesSampled(host, extract_to)
+                FileUtil.extractFile(tar_file_fullname, extract_to)  # 解压文件到当前目录
+                self.__dbUpdFilesSampledFromDescriptionFile(host, extract_to)  # 更新数据库中样本文件表
                 os.remove(tar_file_fullname)
-                common_files, file2merged = Util.mergeFilesByName(extract_to, merge_to)
-                common_files = self.__getNewLogInstance(host, common_files)
-                classified_files, unclassified_files = self.__predict(common_files)
-                Util.dbFilesMerged(self.cursor, file2merged, classified_files, unclassified_files)
+                common_files, file2merged = FileUtil.mergeFilesByName(extract_to, merge_to)
+                common_files = self.__getNewFiles(common_files)  # 滤除以前做过分类预测的文件
+                classified_files, unclassified_files = FileUtil.predictFiles(self.models, common_files)  # 进行分类预测
+                DbUtil.dbUdFilesMerged(self.cursor, classified_files, unclassified_files)  # 更新数据库中合并文件表
                 where_clause = ['"%s"' % common_name.replace('\\', '/') for _, common_name, _, _, _, _ in
                                 classified_files]
                 where_clause = ' AND common_name in (%s)' % ','.join(where_clause)
-                wildcard_log_files = Util.genGatherList(self.cursor, where_clause)  # 生成采集文件列表
-                Util.dbWildcardLogFiles(self.cursor, wildcard_log_files)
+                wildcard_log_files = FileUtil.genGatherList(self.cursor, where_clause)  # 生成采集文件列表
+                DbUtil.dbWildcardLogFiles(self.cursor, wildcard_log_files)  # 更新数据库中采集文件列表
                 self.db.commit()
-                G.log.info('Processed %s successful.', tar_file)
+                G.log.info('%s extracted and classified successful.', tar_file)
             except Exception as err:
-                G.log.warning('processing error:%s', str(err))
+                G.log.warning('%s extracted or classified error:%s', tar_file, str(err))
                 self.db.rollback()
                 continue
 
     # 滤除已成功分类的文件,返回新发现的日志文件
-    def __getNewLogInstance(self, host, common_files):
+    def __getNewFiles(self, common_files):
         new_common_files = []
         for common_file in common_files:
             c_ = '"%s"' % common_file.replace('\\', '/')
@@ -83,7 +85,7 @@ class BatchJobService(object):
                 new_common_files.append(common_file)
         return new_common_files
 
-    def __dbFilesSampled(self, host, extract_to):
+    def __dbUpdFilesSampledFromDescriptionFile(self, host, extract_to):
         host = '"%s"' % host
         description_file = os.path.join(extract_to, 'descriptor.csv')
         for line in open(description_file, encoding='utf-8'):
@@ -107,22 +109,45 @@ class BatchJobService(object):
             self.cursor.execute(sql)
         os.remove(description_file)
 
-    def __predict(self, merged_files):
-        classified_files, unclassified_files = [], []
-        for common_name in merged_files:
-            for model_id, model in enumerate(self.models):
-                if model:  # 模型存在
-                    result = model.predictFile(common_name)
-                    if not result:
-                        continue
-                    category, category_name, confidence, distance = result
-                    if confidence < G.minConfidence:  # 置信度不够,未完成分类
-                        continue
-                    classified_files.append([model_id, common_name, category, category_name, confidence, distance])
-                    break
-            else:
-                unclassified_files.append(common_name)
-        return classified_files, unclassified_files
+    # 重新初始化模型
+    def reInitialization(self):
+        """
+        系统积累了一定量的无法通过产品内置模型分类的样本, 或者产品模型升级后, 重新聚类形成现场模型.
+        清理以前的现场数据 -> 重新合并原始样本->采用内置产品模型分类 -> 日志文件模型聚类 -> 日志记录模型聚类 -> 重新计算基线
+        :return:
+        """
+        self.__clearModelAndConfig()
+        FileUtil.mergeFilesByName(G.l0_inputs, G.l1_cache)
+        product_model = Classifier(model_file=G.productFileClassifierModel)
+        self.__reClassifyAllSamples(product_model)
+        project_model = Classifier()
+        project_model.reCluster()
+
+        self.models = [product_model, project_model]
+
+    @staticmethod
+    def __clearModelAndConfig():
+        for folder in [G.projectModelPath, G.l2_cache, G.outputs]:
+            if os.path.exists(folder):
+                shutil.rmtree(folder)
+        db = DbUtil.dbConnect()
+        if db:
+            cursor = db.cursor()
+            cursor.execute('DELETE FROM file_class')
+            db.commit()
+            db.close()
+
+        time.sleep(3)
+        for folder in [G.projectModelPath, G.l2_cache, G.outputs]:
+            os.mkdir(folder)
+
+    @staticmethod
+    def __reClassifyAllSamples(model):
+        G.log.info('Classifying files in %s by model %s', G.l1_cache, G.productFileClassifierModel)
+        results = model.predictFiles(G.l1_cache)
+        classified_common_files, unclassified_common_files = FileUtil.splitResults(model.model_id, results)
+        with Dbc() as cursor:
+            DbUtil.dbUdFilesMerged(cursor, classified_common_files, unclassified_common_files)
 
 
 if __name__ == '__main__':

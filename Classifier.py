@@ -8,8 +8,6 @@
 
 import os
 import re
-import shutil
-import time
 from collections import Counter
 
 import numpy as np
@@ -21,20 +19,18 @@ from sklearn.cluster import KMeans
 from sklearn.externals import joblib
 
 from config import Workspaces as G
-from utilites import Util
+from utilites import Dbc, FileUtil, DbUtil
 
 
 # 对数十、上百万个文件进行聚类，形成聚类模型
 class Classifier(object):
     """
-    新建对象或者调用trainModel方法，可以生成Classifier模型
-    调用predict方法，可以预测新的日志文件类型及其置信度
-    $DATA/models/l1file_info.csv：记录原始样本文件信息(暂时不要？）
-    $DATA/l1cache/: 存储各样本文件。目录结构就是被管服务器原始结构
+    新建对象或者调用reCluster方法，可以对$DATA/l0cache/重新聚类生成Classifier模型
+    调用predictFile或PredictFiles方法，可以预测新的日志文件类型及其置信度
+    $DATA/l0cache/: 存储各样本文件。目录结构就是被管服务器原始结构
     """
     __corpusCacheFile = os.path.join(G.projectModelPath, 'corpuscache.1')
     l1_dbf = os.path.join(G.projectModelPath, 'metadata.1')
-    __MaxLines = G.cfg.getint('Classifier', 'MaxLines')
 
     def __init__(self, model_file=''):
         self.model_file = model_file
@@ -45,62 +41,33 @@ class Classifier(object):
         self.dictionary = None  # 字典对象(Gensim Dictionary)
         self.model = None  # 聚类模型(Kmeans)
         self.categories = None  # 聚类的类型(名称，数量占比，分位点距离，边界点距离)
+        self.db = None
+        self.cursor = None
+
 
         if os.path.exists(model_file):  # 从模型文件装载模型
             self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories = joblib.load(model_file)
+            self.__dbUpdCategories()
         else:
             G.log.warning('No model loaded!')
 
     # 重新训练模型
     def reCluster(self):
-        for folder in [G.l1_cache, G.l2_cache, G.outputs]:
-            if os.path.exists(folder):
-                shutil.rmtree(folder)
-        time.sleep(3)
-        for folder in [G.l1_cache, G.l2_cache, G.outputs]:
-            os.mkdir(folder)
+        self.db = DbUtil.dbConnect()
+        self.cursor = self.db.cursor() if self.db else None
 
-        common_files, file2merged = Util.mergeFilesByName(G.l0_inputs, G.l1_cache)
-        self.__dbFilesSampled(file2merged)
         results = self.trainModel(k_=35)
         self.__saveModel()  # model saved to file
 
-        Util.clearModel(self.model_id)
-        self.dbUpdCategories()
-
-        db = Util.dbConnect()
-        if not db:
-            return
-        cursor = db.cursor()
-        classified_common_files, unclassified_common_files = self.splitResults(results)
-        Util.dbFilesMerged(cursor, file2merged, classified_common_files, unclassified_common_files)
-        Util.mergeFilesByClass(cursor, G.l2_cache)  # 同类文件合并到to_目录下
-        wildcard_log_files = Util.genGatherList(cursor)  # 生成采集文件列表
-        Util.dbWildcardLogFiles(cursor, wildcard_log_files)
-        db.commit()
-        db.close()
-
-    def __dbFilesSampled(self, file2merged):
-        db = Util.dbConnect()
-        if not db:
-            return
-        cursor = db.cursor()
-        for file_fullname, anchor_name, anchor_colRange, common_file_fullname in file2merged:
-            file_fullname = file_fullname.replace('\\', '/')
-            host = file_fullname[len(G.l0_inputs):].strip('/')
-            host, filename = host.split('/', 1)
-            archive_path, filename = os.path.split(filename)
-            remote_path = '/' + archive_path if archive_path[1] != '_' else archive_path[0] + ':' + archive_path[2:]
-            host = '"%s"' % host.strip('/')
-            archive_path = '"%s"' % archive_path
-            remote_path = '"%s"' % remote_path
-            file_fullname = '"%s"' % file_fullname
-            filename = '"%s"' % filename
-            sql = 'INSERT INTO files_sampled (file_fullname,host,archive_path,filename,remote_path) VALUES(%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE file_fullname=%s' % (
-                file_fullname, host, archive_path, filename, remote_path, file_fullname)
-            cursor.execute(sql)
-        db.commit()
-        db.close()
+        if self.cursor:
+            file_and_results = [self.common_filenames] + list(results)
+            classified_common_files, unclassified_common_files = FileUtil.splitResults(self.model_id, file_and_results)
+            DbUtil.dbUdFilesMerged(self.cursor, classified_common_files, unclassified_common_files)
+            FileUtil.mergeFilesByClass(self.cursor, G.l2_cache)  # 同类文件合并到to_目录下
+            wildcard_log_files = FileUtil.genGatherList(self.cursor)  # 生成采集文件列表
+            DbUtil.dbWildcardLogFiles(self.cursor, wildcard_log_files)
+            self.db.commit()
+            self.db.close()
 
     def __iter__(self):
         self.category_id = 0
@@ -129,20 +96,7 @@ class Classifier(object):
         if name in self.categories[0]:
             raise ValueError
         self.categories[0][key] = name
-        self.dbUpdCategories()
-
-    def dbUpdCategories(self):
-        db = Util.dbConnect()
-        if db:  # Can't connect ro db, waiting and retry forever
-            cursor = db.cursor()
-            c = self.categories
-            for category_id, (name, percent, boundary, quantile) in enumerate(zip(c[0], c[1], c[2], c[3])):
-                name = '"%s"' % name
-                sql = 'INSERT INTO file_class (model_id, category_id, name, quantile, boundary, percent) VALUES(%d, %d, %s, %e,%e, %f) ON DUPLICATE KEY UPDATE name=%s,quantile=%e,boundary=%e,percent=%f' % (
-                    self.model_id, category_id, name, quantile, boundary, percent, name, quantile, boundary, percent)
-                cursor.execute(sql)
-            db.commit()
-        db.close()
+        self.__saveModel()
 
     # 训练、生成模型并保存在$models/xxx.mdl中,dataset:绝对/相对路径样本文件名，或者可迭代样本字符流
     def trainModel(self, dataset_path=G.l1_cache, k_=0):
@@ -197,7 +151,7 @@ class Classifier(object):
     # 建立词典，同时缓存词表文件
     def __buildDictionary(self, new_dataset_path):
         self.dictionary = Dictionary()
-
+        lines = ''
         # 装载处理过的缓存语料
         cache_fp = open(self.__corpusCacheFile, mode='a+t', encoding='utf-8')  # 创建或打开语料缓存文件
         if cache_fp.tell() != 0:
@@ -240,7 +194,6 @@ class Classifier(object):
     def __buildDocument(self, dataset_path):
         amount_files, failed_files, file_fullname = 0, 0, ''
         G.log.info('Start Converting documents from ' + dataset_path)
-
         processed_files = os.path.join(G.projectModelPath, 'buildDocument.dbf')
         processed = [] if not os.path.exists(processed_files) else joblib.load(processed_files)
 
@@ -254,6 +207,9 @@ class Classifier(object):
                     if amount_files % 50 == 0:
                         G.log.info('Converted %d[%d failed] files:\t%s', amount_files, failed_files, file_fullname)
                     processed.append(file_fullname)
+                    if self.__hasClassified(file_fullname):
+                        continue
+
                     yield self.__file2doc(file_fullname)
                 except Exception as err:
                     failed_files += 1
@@ -262,6 +218,16 @@ class Classifier(object):
         joblib.dump(processed, processed_files)
         G.log.info('Converted %d files,%d failed', amount_files, failed_files)
         raise StopIteration()
+
+    # 检查是否已经分过类
+    def __hasClassified(self, common_name):
+        if not self.cursor:
+            return None
+        common_name = '"%s"' % common_name.replace('\\', '/')
+        sql = 'SELECT common_name FROM files_merged WHERE common_name=%s And files_merged.category_id IS NOT NULL' % common_name
+        self.cursor.execute(sql)
+        result = self.cursor.fetchone()
+        return result
 
     # 使用规则集匹配和转换后，转化为词表
     def __file2doc(self, file_fullname, encoding='utf-8'):
@@ -274,7 +240,7 @@ class Classifier(object):
             document += words  # 生成词表
             lc.append(len(line))
             lw.append(len(words))
-            if line_idx > self.__MaxLines:
+            if line_idx > G.maxClassifyLines:
                 break
         line_idx += 1
 
@@ -444,6 +410,7 @@ class Classifier(object):
     def __saveModel(self):
         joblib.dump((self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories),
                     G.projectFileClassifierModel)
+        self.__dbUpdCategories()
         self.dictionary.save_as_text(os.path.join(G.logsPath, 'FileDictionary.csv'))
         category_names, percents, boundaries, quantiles = self.categories
         l2_fd = pd.DataFrame({'类名': category_names, '占比': percents,
@@ -453,15 +420,14 @@ class Classifier(object):
             'Model is built and saved to %s, %s and Database: FileDictionary.csv, FileCategories.csv successful.',
             G.projectFileClassifierModel, G.logsPath)
 
-    def splitResults(self, results):
-        classified_files, unclassified_files = [], []
-        for common_name, category, category_name, confidence, distance in zip(self.common_filenames, results[0],
-                                                                              results[1], results[2], results[3]):
-            if confidence < G.minConfidence:  # 置信度不够,未完成分类
-                unclassified_files.append(common_name)
-            else:
-                classified_files.append([self.model_id, common_name, category, category_name, confidence, distance])
-        return classified_files, unclassified_files
+    def __dbUpdCategories(self):
+        with Dbc() as cursor:
+            c = self.categories
+            for category_id, (name, percent, boundary, quantile) in enumerate(zip(c[0], c[1], c[2], c[3])):
+                name = '"%s"' % name
+                sql = 'INSERT INTO file_class (model_id, category_id, name, quantile, boundary, percent) VALUES(%d, %d, %s, %e,%e, %f) ON DUPLICATE KEY UPDATE name=%s,quantile=%e,boundary=%e,percent=%f' % (
+                    self.model_id, category_id, name, quantile, boundary, percent, name, quantile, boundary, percent)
+                cursor.execute(sql)
 
     # 对单个样本文件进行分类，返回文件名称、时间戳锚点位置，类别和置信度
     def predictFile(self, file_fullname, encoding='utf-8'):
@@ -499,7 +465,7 @@ class Classifier(object):
         corpus = []
         start_ = len(self.common_filenames)
         amount_files, failed_files, file_fullname = 0, 0, ''
-        G.log.info('Start __process documents from ' + dataset_path)
+        G.log.info('Start process documents from ' + dataset_path)
         for dir_path, dir_names, file_names in os.walk(dataset_path):
             try:
                 for file_name in file_names:
@@ -512,6 +478,8 @@ class Classifier(object):
                 failed_files += 1
                 G.log.warning('Failed to __process\t%s, ignored.\t%s', file_fullname, str(err))
                 continue
+        if amount_files == 0:
+            return [[], [], [], [], []]
         G.log.info('Converted %d files,%d(%d%%) failed', amount_files, failed_files, failed_files / amount_files * 100)
 
         vectors = self.__buildVectors(corpus, len(corpus))
@@ -551,8 +519,5 @@ class Classifier(object):
 
 
 if __name__ == '__main__':
-    lc = Classifier()
-    lc.reCluster()
-
-    #    lc.trainModel(G.l1_cache)
-    x = 1
+    print(Classifier.__doc__)
+    print('This program cannot run directly')
