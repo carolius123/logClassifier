@@ -7,14 +7,12 @@
 #
 
 import os
-import re
 from collections import Counter
 
 import numpy as np
 import pandas as pd
 from gensim.corpora import Dictionary
 from gensim.models import TfidfModel
-from scipy.signal import argrelextrema
 from sklearn.cluster import KMeans
 from sklearn.externals import joblib
 
@@ -44,7 +42,6 @@ class Classifier(object):
         self.db = None
         self.cursor = None
 
-
         if os.path.exists(model_file):  # 从模型文件装载模型
             self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories = joblib.load(model_file)
             self.__dbUpdCategories()
@@ -56,7 +53,7 @@ class Classifier(object):
         self.db = DbUtil.dbConnect()
         self.cursor = self.db.cursor() if self.db else None
 
-        results = self.trainModel(k_=35)
+        results = self.trainModel()
         self.__saveModel()  # model saved to file
 
         if self.cursor:
@@ -105,18 +102,7 @@ class Classifier(object):
         :param dataset_path: source path contains merged log files, or iterable char stream
         :param k_: K-means parameter, 0 means auto detect
         """
-        rule_sets = []  # 文本处理的替换、停用词和k-shingle规则
-        for ruleset_name in sorted([section for section in G.cfg.sections() if section.split('-')[0] == 'RuleSet']):
-            replace_rules, stop_words, k_list = [], [], []
-            for key, value in G.cfg.items(ruleset_name):
-                if key == 'stopwords':
-                    stop_words = value.split(',')
-                elif key == 'k-shingles':
-                    k_list = eval(value)
-                else:
-                    replace_from, replace_to = value.split('TO')
-                    replace_rules.append((re.compile(replace_from.strip(), re.I), replace_to.strip()))
-            rule_sets.append((ruleset_name, replace_rules, stop_words, k_list))
+        rule_sets = FileUtil.loadRuleSets()
         # 尝试不同的向量化规则，确定聚类数量K
         for self.ruleSet in rule_sets:
             corpus_fp = self.__buildDictionary(dataset_path)  # 建立字典，返回文档结构信息
@@ -134,7 +120,7 @@ class Classifier(object):
             #                continue
 
             start_k = min(50, int(vectors.shape[0] / 100))
-            k_ = k_ if k_ else self.__pilotClustering(vectors, start_k)  # 多个K值试聚类，返回最佳K
+            k_ = k_ if k_ else FileUtil.pilotClustering('Classifier', vectors, start_k)  # 多个K值试聚类，返回最佳K
             if k_ != 0:  # 找到合适的K，跳出循环
                 break
             self.__clearCache()  # 清除缓存的ruleset
@@ -142,7 +128,7 @@ class Classifier(object):
             raise UserWarning('Cannot generate qualified corpus by all RuleSets')
 
         # 重新聚类, 得到模型(向量数、中心点和距离）和分类(向量-所属类)
-        self.model, percents, boundaries, quantiles = self.__buildModel(k_, vectors)
+        self.model, percents, boundaries, quantiles = FileUtil.buildModel(k_, vectors)
         names = ['fc%d' % i for i in range(len(percents))]
         self.categories = [names, percents, boundaries, quantiles]
         results = self.__getResult(vectors)
@@ -319,93 +305,6 @@ class Classifier(object):
         G.log.info('No starter found')
         return None  # No found,re-samples
 
-    # 聚类，得到各簇SSE（sum of the squared errors)，作为手肘法评估确定ｋ的依据
-    @staticmethod
-    def __pilotClustering(vectors, k_from=1, k_to=G.cfg.getint('Classifier', 'MaxCategory')):
-        norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度标准化因子，保证不同向量的可比性
-        termination_inertia = G.cfg.getfloat('Classifier', 'NormalizedTerminationInertia') * norm_factor
-        cfg_q = G.cfg.getfloat('Classifier', 'Quantile')
-        k_, pilot_list = 0, []  # [(k_, inertia, criterion, top5_percent, bad_percent)] criteria取inertia变化率的一阶微分的极大值
-        # 从k_from到k_to聚类,得到pilot_list
-        for k_ in range(k_from, k_to):
-            kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
-            if k_ < k_from + 2:
-                pilot_list.append([k_, kmeans.inertia_, 0, 0, 0])
-                continue
-
-            retry = 0  # 多聚几次,保证inertia递减
-            for retry in range(5):  # 如果inertia因误差变大，重新聚几次
-                inertia = kmeans.inertia_
-                if inertia <= pilot_list[-1][1]:
-                    break
-                G.log.debug('retries=%d, inertia=%e', retry + 1, inertia)
-                kmeans = KMeans(n_clusters=k_).fit(vectors)
-            else:
-                inertia = pilot_list[-1][1]
-
-            pilot_list[-1][2] = pilot_list[-2][1] / pilot_list[-1][1] - pilot_list[-1][1] / inertia
-            a = pilot_list[-1]
-            G.log.info('pilot clustering. (k,inertia,criteria,top5,bad)=\t%d\t%e\t%.3f\t%.3f\t%.3f',
-                       pilot_list[-1][0], pilot_list[-1][1], pilot_list[-1][2], pilot_list[-1][3], pilot_list[-1][4])
-
-            top5_percent = sum([v for (k, v) in Counter(kmeans.labels_).most_common(5)]) / len(kmeans.labels_)
-            # 计算距离特别远（0.8分位点2倍距离以上）的坏点比例
-            v_scores = -np.array([kmeans.score([v]) for v in vectors])
-            groups = pd.DataFrame({'C': kmeans.labels_, 'S': v_scores}).groupby('C')
-            c_quantiles_double = 2 * np.array([groups.get_group(i)['S'].quantile(cfg_q) for i in range(k_)])
-            bad_samples = 0
-            for idx, score in enumerate(v_scores):
-                if score > c_quantiles_double[kmeans.labels_[idx]]:
-                    bad_samples += 1
-            bad_percent = bad_samples / len(v_scores)
-
-            pilot_list.append([k_, inertia, None, top5_percent, bad_percent])
-            if inertia < termination_inertia:  # 已经收敛到很小且找到可选值，没必要继续增加
-                break
-        # 从pilot list中取极大值的top5
-        pilot_list = np.array(pilot_list)[1:-1, :]  # 去掉第一个和最后一个没法计算criterion值的
-        pilot_list = pilot_list[pilot_list[:, 3] < G.cfg.getfloat('Classifier', 'Top5Ratio')]  # 去掉top5占比超标的
-        pilot_list = pilot_list[argrelextrema(pilot_list[:, 2], np.greater)]  # 得到极大值
-        criteria = pilot_list[:, 2].tolist()
-        if not criteria:  # 没有极值
-            return None
-
-        max_top_n, idx_ = [], 0
-        while criteria[idx_:]:
-            idx_ = criteria.index(max(criteria[idx_:]))
-            max_top_n.append(pilot_list[idx_])
-            idx_ += 1
-        G.log.debug('topN k=\n%s',
-                    '\n'.join(['%d\t%e\t%.3f\t%.3f\t%.3f' % (k, i, c, t, b) for k, i, c, t, b in max_top_n]))
-        products = [k * c for k, i, c, t, b in max_top_n]
-        idx_ = products.index(max(products))
-        preferred = max_top_n[idx_][0]
-        G.log.info('pilot-clustering[k:%d] finished. preferred k=(%d)', k_, preferred)
-        return preferred
-
-    # 重新聚类，得到各Cluster的中心点、分位点距离、边界距离以及数量占比等
-    @staticmethod
-    def __buildModel(k_, vectors):
-        # 再次聚类并对结果分组。 Kmeans不支持余弦距离
-        kmeans = KMeans(n_clusters=k_, n_init=20, max_iter=500).fit(vectors)
-        norm_factor = - vectors.shape[1]  # 按字典宽度归一化
-        groups = pd.DataFrame({'C': kmeans.labels_, 'S': [kmeans.score([v]) / norm_factor for v in vectors]}).groupby(
-            'C')
-        percents = groups.size() / len(vectors)  # 该簇向量数在聚类总向量数中的占比
-        cfg_q = G.cfg.getfloat('Classifier', 'Quantile')
-        quantiles = np.array([groups.get_group(i)['S'].quantile(cfg_q, interpolation='higher') for i in range(k_)])
-        boundaries = groups['S'].agg('max').values  # 该簇中最远点距离
-
-        quantiles2 = quantiles * 2
-        boundaries[boundaries > quantiles2] = quantiles2[boundaries > quantiles2]  # 边界太远的话，修正一下
-        boundaries[boundaries < 1e-100] = 1e-100  # 边界为零的话，修正一下
-        quantiles = boundaries - quantiles
-        quantiles[quantiles < 1e-100] = 1e-100  # 避免出现0/0
-
-        G.log.info('Model(k=%d) built. inertia=%e， max proportion=%.2f%%, max quantile=%e, max border=%e',
-                   k_, kmeans.inertia_, max(percents) * 100, max(quantiles), max(boundaries))
-        return kmeans, percents, boundaries, quantiles
-
     # 保存文本格式模型
     def __saveModel(self):
         joblib.dump((self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories),
@@ -489,23 +388,8 @@ class Classifier(object):
 
     # 预测分类并计算可信度。<0 表示超出边界，完全不对，〉1完全表示比分位点还近，非常可信
     def __getResult(self, vectors):
-        c_names, c_percents, c_boundaries, c_quantiles = self.categories
-        norm_factor = - vectors.shape[1]  # 按字典宽度归一化
-
-        predicted_labels = self.model.predict(vectors)  # 使用聚类模型预测记录的类别
-        predicted_names = [c_names[label] for label in predicted_labels]
-        confidences = []
-        distances = []
-        for i, v in enumerate(vectors):
-            distance = self.model.score([v]) / norm_factor
-            distances.append(distance)
-            category = predicted_labels[i]
-            confidences.append((c_boundaries[category] - distance) / c_quantiles[category])
-        confidences = np.array(confidences, copy=False)
-        confidences[confidences > 99.9] = 99.9
-        confidences[confidences < -99.9] = -99.9
-
-        return predicted_labels, predicted_names, confidences, distances
+        c_names, _, c_boundaries, c_quantiles = self.categories
+        return FileUtil.getPredictResult(self.model, c_names, c_boundaries, c_quantiles, vectors)
 
     # 删除缓存文件
     def __clearCache(self):
@@ -521,3 +405,4 @@ class Classifier(object):
 if __name__ == '__main__':
     print(Classifier.__doc__)
     print('This program cannot run directly')
+

@@ -25,6 +25,7 @@ class OnlineService(object):
 
     def __init__(self):
         self.service_id = G.cfg.getint('OnlineService', 'ServiceID')
+        self.threads = {}  # 保存日志流的source id 和 线程的id
         self.models = []
         for model_file in [G.productFileClassifierModel, G.projectFileClassifierModel]:
             if os.path.exists(model_file):
@@ -32,21 +33,40 @@ class OnlineService(object):
             else:
                 model = None
             self.models.append(model)
+        threading.Thread(target=self.deamon).start()
 
     # Deamon for new flow
     def deamon(self):
-        x = 1
+        G.log.info('OnlineService::deamon started, ready for accept new log flow.')
+        while True:
+            time.sleep(60)
+            G.log.debug('I am alive')
 
     # dispatch a new thread to a new flow
     def dispatcher(self, source_id, data_flow, host=None, path=None, wildcard_name=None):
         source_id = str(source_id)
+        if self.__isRunning(source_id):
+            G.log.warning('Service-source[%d-%s] is running when new connection come, Ignore the new one',
+                          self.service_id, source_id)
+            return False
+
         flow_id, flow_status = self.getFlowID(source_id, host, path, wildcard_name)
         t = threading.Thread(target=self.threadLogFlow, args=(flow_id, source_id, flow_status, data_flow))
+        self.threads[source_id] = t
         t.start()
+
+    # 检查该流的处理线程是否活着
+    def __isRunning(self, source_id):
+        if source_id not in self.threads.keys():
+            return False
+
+        result = self.threads[source_id] in threading.enumerate()
+        self.threads.pop(source_id) if not result else None
+        return result
 
     # thread to deal a data flow
     def threadLogFlow(self, flow_id, source_id, status, data_flow):
-        G.log.info('Thread for log flow[%d-%d] started at %s', self.service_id, flow_id, status)
+        G.log.info('Thread for log flow[%d-%d-%s] started at %s', flow_id, self.service_id, source_id, status)
         if status == '未锚定':
             status, file_name = self.bufferFlow(flow_id, source_id, status, data_flow)
             if status == 'OK':  # 缓存行数已经足够
@@ -55,12 +75,16 @@ class OnlineService(object):
             status = self.bufferFlow(flow_id, source_id, status, data_flow)[0]
         if status == '活动中':
             status = self.working(flow_id, status, data_flow)
-        G.log.info('Thread for log flow[%d-%d] terminated at %s', self.service_id, flow_id, status)
+
+        G.log.info('Thread for log flow[%d-%d-%s] terminated at %s', flow_id, self.service_id, source_id, status)
+        if source_id in self.threads.keys():
+            self.threads.pop(source_id)
 
     # OnlineService接收到一个新连接请求时, 调用本过程获得流id
     def getFlowID(self, source_id, host=None, path=None, wildcard_name=None):
         """
         Get the flow_id for a new connection
+        :param wildcard_name:
         :param path:
         :param source_id: id from source to identify different flow
         :param host: path:wildcard_name: match key to distribute to the source
@@ -152,8 +176,6 @@ class OnlineService(object):
         result = cursor.fetchone()
         return result
 
-    # 更新flow某一行数据
-
     # 文件分类预测
     def predict(self, flow_id, inbox_file):
         try:  # 计算时间戳锚点, 滤掉没有锚点的文件
@@ -182,11 +204,11 @@ class OnlineService(object):
             common_file_fullname])  # 进行分类预测. classified_files [[model_id, common_name, category, category_name, confidence, distance]], unclassified_files [common_name]
 
         with Dbc() as cursor:
-            file2merged = [[file_fullname, anchor.name, anchor.colRange[0], anchor.colRange[1], common_file_fullname]]
+            file2merged = [[file_fullname, anchor.name, anchor.colSpan[0], anchor.colSpan[1], common_file_fullname]]
             DbUtil.dbUpdFilesSampled(cursor, file2merged)
             DbUtil.dbUdFilesMerged(cursor, classified_files, unclassified_files)  # 更新数据库中合并文件表
 
-            anchor_info = '%s:%d:%d' % (anchor.name, anchor.colRange[0], anchor.colRange[1])
+            anchor_info = '%s:%d:%d' % (anchor.name, anchor.colSpan[0], anchor.colSpan[1])
             if len(classified_files):
                 status = '活动中'
                 model_id, _, category_id, category_name, _, _ = classified_files[0]
@@ -202,11 +224,18 @@ class OnlineService(object):
         return status
 
     def working(self, flow_id, flow_status, data_flow):
+        for line in data_flow:
+            pass
+        print('last Line:', line)
+        time.sleep(300)
         return '活动中'
 
 
 if __name__ == '__main__':
     ols = OnlineService()
+    ols.dispatcher('abc', open('D:\\home\\suihf\\data\\fc28', 'r', encoding='utf-8'))
+    ols.dispatcher('abc', open('D:\\home\\suihf\\data\\fc28', 'r', encoding='utf-8'))
+    ols.dispatcher('abc', open('D:\\home\\suihf\\data\\fc28', 'r', encoding='utf-8'))
     ols.dispatcher('abc', open('D:\\home\\suihf\\data\\fc28', 'r', encoding='utf-8'))
     ols.dispatcher('def', open(
         'D:/home/suihf/data/l0inputs/10.20.23.139/home/cims/domains/ip_ap_dm/servers/ApServer/logs/access.log00720',
@@ -214,4 +243,3 @@ if __name__ == '__main__':
     ols.dispatcher('xxx', open(
         'D:/home/suihf/data/l0inputs/10.20.23.139/home/cims/domains/ip_ap_dm/servers/ApServer/logs/ApServer.log', 'r',
         encoding='utf-8'))
-    x = 1

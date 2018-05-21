@@ -3,13 +3,14 @@
 # @File  : anchor.py
 # @Author: Sui Huafeng
 # @Date  : 2018/4/9
-# @Desc  :
+# @Desc  : 扫描样本文件，确定时间戳锚点的列所在范围.并可计算锚点时间值
 #
-"""
-设定时间戳锚点，或者扫描样本文件，确定时间戳锚点的列所在范围。
-"""
 
+import datetime
 import re
+import time
+
+import numpy as np
 
 from config import Workspaces as G
 
@@ -20,40 +21,50 @@ class Anchor(object):
     列的位置相对固定。
     """
     __TimeSep = [r'(:|Ê±|时|时-)', r'(:|·Ö|分|分-)']
-    __PosHHMMSS = {'COLON': (1, 3, 5, 6), 'SECONDS': (None, None, 1, None), 'HHMMSS': (1, 2, 3, None)}
+    __TimeIdx = {'COLON': (1, 3, 5, 6), 'SECONDS': (None, None, 1, None), 'HHMMSS': (1, 2, 3, None)}
     __TimeSpecs = {'COLON': '(\d+)' + __TimeSep[0] + r'(\d|[0-5]\d)' + __TimeSep[1]
                             + r'(\d|[0-5]\d)([\.:,]\d{2,3})?(?!\d)',
                    'SECONDS': r'(?<!\d)(15\d{8})\.\d+',
                    'HHMMSS': r'(?<!\d)([0-1]\d|2[0-3])([0-5]\d)([0-5]\d)(?!\d)'
                    }
     __TimeRegExp = re.compile('|'.join('(?P<%s>%s)' % (k_, v_) for k_, v_ in __TimeSpecs.items()), re.I)
+    __MonthRegex = re.compile(r'(?<=\W)(Jan)|(Feb)|(Mar)|(Apr)|(May)|(Jun|June)|(Jul|July)|(Aug)|(Sep|Sept)'
+                              r'|(Oct)|(Nov)|(Dec)(?=\W)', re.I)
+    __DateSep = r'(?P<sep>[\\/-])'
+    __HyphenDateRegex = re.compile(r'(?<!\d)(\d{1,4})' + __DateSep + '(\d{1,4})((?P=sep))(\d){1,4}(?!\d)')
+    __DigitalDateRegex = re.compile(r'(?<!\d)((20)?([12]\d))?(0\d|1[012])([012]\d|3[01])(?!\d)')
+    __PmRegex = re.compile(r'(?<=[\d\s])(pm\s|下午)(?=[\d\s])', re.I)
 
     # 从sample file提取时间戳锚点，或者按anchor等参数设置时间戳锚点
-    def __init__(self, sample_file=None, col_range=(0, None), name='COLON'):
-        self.colRange = col_range  # (搜索的开始列，结束列)
+    def __init__(self, sample_file=None, col_span=(0, None), name='COLON', probe_date=True):
+        self.colSpan = col_span  # (搜索的开始列，结束列)
         self.name = name  # 时间戳锚点正则表达式名称，及各值(年月日时分秒和上下午)在match对象中的位置
-        self.regExp = re.compile('(%s)' % self.__TimeSpecs[name], re.I) if name else None
+        self.timeRegExp = re.compile('(%s)' % self.__TimeSpecs[name], re.I) if name else None
+        self.datePattern = {}  # {'left':True, 'y':0, 'm':2, 'd':4
 
-        self.setFormat(self.__getAnchor(sample_file)) if sample_file else None
+        self.setTimeFormat(self.__getTimeData(sample_file)) if sample_file else None
+        self.probeDatePattern(sample_file) if probe_date and self.name == 'COLON' else None
+
 
     # 记录样本文件每行的第一和最后一个时间戳的位置和内容(最后一个时间戳记录距离尾部的距离）
     @classmethod
-    def __getAnchor( cls, sample_file ):
+    def __getTimeData(cls, sample_file):
         line_idx = 0
-        anchors = {}  # 初始化潜在锚点字典
+        time_info = {}  # 初始化潜在锚点字典
         try:
             for line_idx, line in enumerate(open(sample_file, 'r', encoding='utf-8')):
-                if cls.appendAnchors(line, anchors):  # 已经找够了时间戳锚点
+                if cls.stackTimeData(line, time_info):  # 已经找够了时间戳锚点
                     break
-                if line_idx > 1000 and not anchors:  # 很多行都没找到时间戳
+                if line_idx > 1000 and not time_info:  # 很多行都没找到时间戳
                     break
         except Exception as err:
             G.log.warning('Line[%d] in %s ignored due to the following error:%s', line_idx, sample_file, str(err))
 
-        return Anchor.statsAnchors(anchors, line_idx)
+        return Anchor.statsTimeData(time_info, line_idx)
 
+    #  从字符串line中抽取第一和最后时间戳，追加到match_groups
     @classmethod
-    def appendAnchors( cls, line, anchors ):
+    def stackTimeData(cls, line, anchors):
         """
         从字符串line中抽取第一和最后时间戳，追加到match_groups
         :param line: 输入字符串
@@ -71,7 +82,7 @@ class Anchor(object):
             stop_ = match_.end() if i == 0 else match_.end() - len(line)  # stop col position of first one
             inc_counter, dec_counter, stop_max, last_time = anchors.get((start_, regex_name), [0, 0, -30000, 0])
             this_time = 0.
-            for idx, hms_offset in enumerate(cls.__PosHHMMSS[regex_name]):
+            for idx, hms_offset in enumerate(cls.__TimeIdx[regex_name]):
                 if not hms_offset or not match_.group(base_idx + hms_offset):  # None不参与计算
                     value = '0'
                 elif idx == 3:  # 毫秒，去掉分隔符，取10ms精度(毫秒级三位有一定比例错序的)
@@ -94,8 +105,9 @@ class Anchor(object):
                 return True
         return False
 
+    #  统计得到最佳Anchor
     @staticmethod
-    def statsAnchors( anchors, lines ):
+    def statsTimeData(anchors, lines):
         """
         统计得到最佳Anchor
         :param anchors: appendAnchors返回的字典对象组成的列表
@@ -117,46 +129,208 @@ class Anchor(object):
                               % (inc_anchors, dec_anchors, lines))
         return anchors[0]
 
-    def setFormat(self, anchor):
+    #  设置Anchor的属性
+    def setTimeFormat(self, anchor):
         """
-        跟据日志中日期变化规律(先日再月后年)，确定日期格式
         :param anchor: statsAnchors返回的字典对象
         """
         (start_, name_), (amount_, dec_counter, stop_, last_time) = anchor
         # 考虑时间戳前后可能有变长变量(如INFO，CRITICAL等），给起止位置留一定余量(前后5个字符）
-        self.colRange = (0 if 0 <= start_ < G.same_anchor_width else start_ - G.same_anchor_width,
-                         0 if -G.same_anchor_width <= stop_ < 0 else stop_ + G.same_anchor_width)
+        self.colSpan = (0 if 0 <= start_ < G.timeMargin else start_ - G.timeMargin,
+                        0 if -G.timeMargin <= stop_ < 0 else stop_ + G.timeMargin)
         self.name = name_  # 设置正则表达式名称
-        self.regExp = re.compile('(%s)' % self.__TimeSpecs[name_], re.I)  # 设置正则表达式
+        self.timeRegExp = re.compile('(%s)' % self.__TimeSpecs[name_], re.I)  # 设置正则表达式
 
-    def getAnchorTimeStamp( self, line ):
+    # 跟据日志中日期变化规律(先日再月后年)，找出并确定日期格式
+    def probeDatePattern(self, sample_file):
+        counter, results = 0, set()
+        left = {True: 0, False: 0}
+        try:
+            for line in open(sample_file, 'r', encoding='utf-8'):
+                time_ = self.timeRegExp.search(line[self.colSpan[0]:self.colSpan[1]])
+                if not time_:  # 没有搜到有效的时间戳
+                    continue
+                counter += 1
+                time_span = time_.span()
+                self.__probeHyphenDate(time_span, line, results, left)
+                if len(results) >= 2 or (counter > 5 and not results):  # 很多行都没找到时间戳
+                    break
+            self.__setDatePattern(results, left)
+        except Exception as err:
+            G.log.warning('%s ignored due to the following error:%s', sample_file, str(err))
+
+    # 找带分隔符的日期
+    def __probeHyphenDate(self, time_span, line, results, left):
+        base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
+        line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex), line)
+        line = re.sub(r'[年月日]', '-', line)
+
+        start_col = base_col + time_span[0] - G.dateMargin
+        start_col = 0 if start_col < 0 else start_col
+
+        match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.dateMargin])
+        if match_:
+            left[True] += 1
+        else:
+            start_col = base_col + time_span[1]
+            match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.dateMargin])
+            if match_:
+                left[False] += 1
+
+        if match_:
+            disordered_date = match_.group()
+            disordered_date = re.sub(self.__DateSep, '/', disordered_date)
+            results.add(disordered_date)
+
+    def __setDatePattern(self, results, left):
+        if results:
+            date_mask = self.__probeDateOrder(results)
+            for i in range(3):
+                self.datePattern[date_mask[i]] = i * 2
+
+            date_margin = G.dateMargin
+            self.datePattern['left'] = True if left[True] > left[False] else False
+
+    # 确定年月日的顺序, 依据包括：日期变化规律、4位是年、大于2位年的是日、唯一大于12的是年，唯一小于12的是月
+    @staticmethod
+    def __probeDateOrder(unordered_dates, filename=''):
+        unordered_dates = list(unordered_dates)
+        unordered_dates = np.array([[int(cell) for cell in row.split('/')] for row in unordered_dates])
+
+        date_value = np.max(unordered_dates, axis=0)
+        date_mask = np.array(['', '', ''])
+
+        # 先按照日期的前后变化找规律(如先后两行出现18-2-3、18-2-4)
+        diff_ = (date_value - np.min(unordered_dates, axis=0))
+        if np.max(diff_) > 0:  # 时间戳起码是跨天的，变化最大的一定是日
+            date_mask[diff_ == np.max(diff_)] = 'd'
+        else:  # 所有时间戳都是同一天的, 拿日期数字的值碰碰运气
+            this_year = int(time.strftime('%y'))
+            date_mask[date_value > 2000] = 'y'  # 4位肯定是年份
+            date_value[date_value > 2000] = date_value[date_value > 2000] - 2000
+            date_mask[date_value == 0] = 'y'  # 0是None转过来的，肯定是年
+            date_value[date_value == 0] = this_year
+            date_mask[date_value > this_year] = 'd'  # 大于2位年份、小于4位年份，肯定是日
+
+        mask_r = {v: idx for idx, v in enumerate(list(date_mask))}
+        if mask_r.get('d') is not None:  # 只要日找到，年月肯定可区分(年份数字一定大于月份数字,2013年以后）
+            date_mask[date_mask != 'd'] = ''  # 先把可能未知的年、月清零
+            date_value[date_mask == 'd'] = 0  # 比较大小前屏蔽掉已知的日
+            date_mask[date_value == np.max(date_value)] = 'y'  # 大的是年
+            date_mask[date_mask == ''] = 'm'  # 剩下的是月
+        else:  # 未找到日期，所有时间戳都是同一天的, 接着检查日期数字的值
+            less_than12_times = date_value[date_value <= 12].shape[0]  # 小于12的个数
+            if less_than12_times == 1:
+                date_mask[date_value <= 12] = 'm'  # 唯一不大于12的是月份
+            elif less_than12_times == 2:
+                date_mask[date_value > 12] = 'y'  # 唯一大于12的是年份
+            elif date_value[date_value == np.max(date_value)].shape[0] == 1:  # 最大值当作年
+                date_mask[date_value == np.max(date_value)] = 'y'
+
+            # 无法完全确定的，按可能性大小设置
+            mask_r = {v: idx for idx, v in enumerate(list(date_mask))}
+            if mask_r.get('m') == 0 or mask_r.get('y') == 2:
+                date_mask = np.array(['m', 'd', 'y'])
+            elif mask_r.get('m') == 2:
+                date_mask = np.array(['y', 'd', 'm'])
+            elif mask_r.get('y') == 1:
+                date_mask = np.array(['d', 'y', 'm'])
+            else:
+                date_mask = np.array(['y', 'm', 'd'])
+            G.log.warning('Failed to probe date format(only one date:%d-%d-%d), using %s instead. %s'
+                          % (date_value[0], date_value[1], date_value[2], '-'.join([x + x for x in date_mask]),
+                             filename))
+
+        return date_mask
+
+    # 返回锚点的日期时间值
+    def getTimeStamp(self, line):
         """
         返回锚点的时间戳值，如不存在，返回None
         :param line: 需要寻找时间戳的字符串
         :return: 时间戳值，如不存在，返回None
         """
-        if self.regExp is None:
+        if not self.timeRegExp:
             raise UserWarning('Failed to getAnchorTimeStamp: Anchor is not initialized!')
+        time_ = self.timeRegExp.search(line[self.colSpan[0]:self.colSpan[1]])
+        if not time_:  # 没有搜到有效的时间戳
+            return None
 
-        anchor_timestamp = self.regExp.search(line[self.colRange[0]:self.colRange[1]])
-        return anchor_timestamp if anchor_timestamp else None
+        if self.name == 'SECONDS':
+            anchor_timestamp = float(time_.group())
+            return anchor_timestamp
+
+        v = time_.groups()
+        idx = self.__TimeIdx[self.name]
+        anchor_time = datetime.time(int(v[idx[0]]), int(v[idx[1]]), int(v[idx[2]]))
+        anchor_date = None
+        time_span = time_.span()
+        if self.name == 'COLON':
+            if not self.datePattern:  # 未probe日期或者无日期, 取今天或昨天
+                if datetime.datetime.today().time() > anchor_time:
+                    anchor_date = datetime.date.today()
+                else:
+                    anchor_date = datetime.date.today() - datetime.timedelta(days=1)
+            else:
+                anchor_date = self.__getHyphenDate(time_span, line)
+                if self.__isAfternoon(time_span, line):
+                    anchor_date += datetime.timedelta(hours=12)
+        elif self.name == 'HHMMSS':
+            anchor_date = self.__getDigitDate(time_span, line)
+
+        anchor_timestamp = time.mktime(datetime.datetime.combine(anchor_date, anchor_time).timetuple())
+
+        return anchor_timestamp
+
+    def __getHyphenDate(self, time_span, line):
+        base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
+        line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex), line)
+        line = re.sub(r'[年月日]', '-', line)
+
+        start_col = base_col + time_span[0] - G.dateMargin if self.datePattern['left'] else base_col + time_span[1]
+        start_col = 0 if start_col < 0 else start_col
+        match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.dateMargin])
+        if not match_:
+            return None
+        v = match_.groups()
+        year = int(v[self.datePattern['y']])
+        year += 2000 if year < 100 else 0
+        anchor_date = datetime.date(year, int(v[self.datePattern['m']]), int(v[self.datePattern['d']]))
+        return anchor_date
+
+    def __isAfternoon(self, time_span, line):
+        base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
+        start_col = base_col + time_span[0] - 5
+        start_col = 0 if start_col < 0 else start_col
+        match_ = self.__PmRegex.search(line[start_col:start_col + 5])
+        if not match_:
+            start_col = base_col + time_span[1]
+            match_ = self.__PmRegex.search(line[start_col:start_col + 5])
+        if match_:
+            return True
+        return False
+
+    def __getDigitDate(self, time_span, line):
+        base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
+        start_col = base_col + time_span[0] - 10
+        start_col = 0 if start_col < 0 else start_col
+        match_ = self.__DigitalDateRegex.search(line[start_col:start_col + 10])
+        if not match_:
+            return None
+
+        v = match_.groups()
+        yy = 0 if v[1] is None else int(v[1]) * 100
+        yy += int(v[2])
+        anchor_date = datetime.date(yy, int(v[3]), int(v[4]))
+        return anchor_date
 
 
 if __name__ == '__main__':
     import os
 
-
-    def __process(file_fullname):
-        filename = os.path.split(file_fullname)[1]
-        try:
-            a = Anchor(file_fullname)
-            G.log.info('%s\t%s\t%s\t%d' % (filename, file_fullname, a.name, a.colRange[0]))
-        except Exception as e:
-            G.log.error('%s\t%s\tERROR\t%s' % (filename, file_fullname, str(e)))
-
-
     def __run():
-        file_or_path = input('input a path or full file name:')
+        file_or_path = 'D:\\home\\chinalife\\10.20.100.10\\zabbix\\log\\zabbix_agentd.log'
+        #            input('input a path or full file name:')
         if not file_or_path.strip():
             return False
         if not os.path.exists(file_or_path):
@@ -171,6 +345,17 @@ if __name__ == '__main__':
                 file_fullname = os.path.join(dir_path, filename)
                 __process(file_fullname)
         return True
+
+
+    def __process(file_fullname):
+        filename = os.path.split(file_fullname)[1]
+        try:
+            a = Anchor(file_fullname, probe_date=True)
+            for line in open(file_fullname, 'r', encoding='utf-8'):
+                a.getTimeStamp(line)
+            G.log.info('%s\t%s\t%s\t%d' % (filename, file_fullname, a.name, a.colSpan[0]))
+        except Exception as e:
+            G.log.error('%s\t%s\tERROR\t%s' % (filename, file_fullname, str(e)))
 
 
     while __run():

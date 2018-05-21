@@ -39,9 +39,11 @@ class BatchJobService(object):
     def run(self):
         self.db = DbUtil.dbConnect()
         if not self.db:  # Can't connect ro db, schedule to next
+            G.log.warning('Batch Service error, scheduled to next time')
             threading.Timer(self.interval, self.run).start()
         self.cursor = self.db.cursor()
         self.classifyNewLogs()
+        self.db.commit()
         self.db.close()
         threading.Timer(self.interval, self.run).start()
 
@@ -119,7 +121,8 @@ class BatchJobService(object):
         self.__clearModelAndConfig()
         FileUtil.mergeFilesByName(G.l0_inputs, G.l1_cache)
         product_model = Classifier(model_file=G.productFileClassifierModel)
-        self.__reClassifyAllSamples(product_model)
+        if product_model.model:
+            self.__reClassifyAllSamples(product_model)
         project_model = Classifier()
         project_model.reCluster()
 

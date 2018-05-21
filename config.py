@@ -41,7 +41,8 @@ class Workspaces(object):
         if not os.path.exists(__folder):
             os.mkdir(__folder)
 
-    same_anchor_width = cfg.getint('General', 'SameAnchorWidth')
+    timeMargin = cfg.getint('General', 'TimeMargin')
+    dateMargin = cfg.getint('General', 'DateMargin')
     last_update_seconds = cfg.getint('Classifier', 'LastUpdateHours') * 3600
     '''
     fileDescriptor文件保存如下列表: [[l0_filenames], [fd_origin], [fd_common], [fd_category]]. 其中,
@@ -61,9 +62,6 @@ class Workspaces(object):
     fileCheckPattern = re.compile(cfg.get('Classifier', 'FileCheckPattern'))
     minConfidence = cfg.getfloat('Classifier', 'MinConfidence')
     maxClassifyLines = cfg.getint('Classifier', 'MaxLines')
-
-
-    l2FilesList = os.path.join(projectModelPath, 'l2file_info.csv')  # l2_cache中文件的元数据：包括文件名称、定界时间位置、日志类型等
 
     win = (system() == 'Windows')  # 本机操作系统类型，用于处理路径分隔符等Win/Unix的差异
 
