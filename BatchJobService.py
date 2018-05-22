@@ -106,8 +106,8 @@ class BatchJobService(object):
             remote_path, _ = os.path.split(ori_name)
             remote_path = '"%s"' % remote_path.replace('\\', '\\\\')
             sql = 'INSERT INTO files_sampled (file_fullname,host,archive_path,filename,remote_path,last_update,last_collect,size) VALUES(%s,%s,%s,%s,%s,%s,%s,%d) ON DUPLICATE KEY UPDATE last_update=%s, last_collect=%s, size=%d' % (
-            file_fullname, host, archive_path, filename, remote_path, last_update_time, gather_time, ori_size,
-            last_update_time, gather_time, ori_size)
+                file_fullname, host, archive_path, filename, remote_path, last_update_time, gather_time, ori_size,
+                last_update_time, gather_time, ori_size)
             self.cursor.execute(sql)
         os.remove(description_file)
 

@@ -82,7 +82,7 @@ class Workspaces(object):
 
     # 对一个样本(字符串)进行处理，返回词表[word]
     @classmethod
-    def getWords( cls, document, rule_set ):
+    def getWords(cls, document, rule_set):
         """
 
         :param document:
@@ -115,4 +115,3 @@ class Workspaces(object):
 
         # 合并返回单词列表
         return keep_words + k_shingles
-

@@ -1,8 +1,23 @@
 <component name="ProjectDictionaryState">
   <dictionary name="admin">
     <words>
+      <w>ailog</w>
+      <w>asctime</w>
+      <w>cims</w>
+      <w>corpuscache</w>
+      <w>deamon</w>
       <w>filenames</w>
       <w>filnames</w>
+      <w>gensim</w>
+      <w>kshingle</w>
+      <w>levelname</w>
+      <w>lineno</w>
+      <w>mmdd</w>
+      <w>passwd</w>
+      <w>suihf</w>
+      <w>tfidf</w>
+      <w>yyhhdd</w>
+      <w>yyyymmdd</w>
     </words>
   </dictionary>
 </component>

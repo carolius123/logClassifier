@@ -23,13 +23,13 @@ from config import Workspaces as G
 
 
 class Dbc(object):
-    db_name, db_addr, db_user, db_passwd = G.cfg.get('General', 'db').split(':')
+    db_type, db_addr, db_user, db_passwd = G.cfg.get('General', 'db').split(':')
 
     def __init__(self):
         self.conn = None
         self.cursor = None
-        if self.db_name == 'mysql':
-            self.conn = pymysql.connect(self.db_addr, self.db_user, self.db_passwd, 'ailog', charset='utf8')
+        if self.db_type == 'mysql':
+            self.conn = pymysql.connect(self.db_addr, self.db_user, self.db_passwd, 'ailog-backend', charset='utf8')
             self.cursor = self.conn.cursor()
 
     def __enter__(self):
@@ -338,9 +338,9 @@ class FileUtil(object):
         return wildcard_log_files
 
     @staticmethod
-    def __querySamples(cursor, addtional_where):
+    def __querySamples(cursor, additional_where):
         sql = 'SELECT model_id,category_id, host, remote_path, filename, common_name,anchor_name, anchor_start_col, anchor_end_col,last_collect,last_update FROM files_classified WHERE confidence >= %f %s ORDER BY model_id, category_id, host, remote_path' % (
-            G.minConfidence, addtional_where)
+            G.minConfidence, additional_where)
         cursor.execute(sql)
         return cursor.fetchall()
 
@@ -442,10 +442,10 @@ class DbUtil(object):
     # 连接数据库
     @classmethod
     def dbConnect(cls):
-        db_name, db_addr, db_user, db_passwd = G.cfg.get('General', 'db').split(':')
+        db_type, db_addr, db_user, db_passwd = G.cfg.get('General', 'db').split(':')
         try:
-            if db_name == 'mysql':
-                db = pymysql.connect(db_addr, db_user, db_passwd, 'ailog', charset='utf8')
+            if db_type == 'mysql':
+                db = pymysql.connect(db_addr, db_user, db_passwd, 'ailog-backend', charset='utf8')
                 return db
             else:
                 return None
@@ -477,6 +477,7 @@ class DbUtil(object):
                 try:
                     cursor.execute(sql)
                 except Exception as err:
+                    G.log.warning('Error in dbInsert %s', str(err))
                     continue
 
     #  插入或更新合并文件分类表

@@ -41,7 +41,7 @@ class Anchor(object):
     __PmRegex = re.compile(r'(?<=[\d\s])(pm\s|下午)(?=[\d\s])', re.I)
 
     # 从sample file提取时间戳锚点，或者按anchor等参数设置时间戳锚点
-    def __init__(self, sample_file=None, col_span=(0, None), name='COLON', probe_date=True):
+    def __init__(self, sample_file=None, col_span=(0, None), name='COLON', probe_date=False):
         self.colSpan = col_span  # (搜索的开始列，结束列)
         self.name = name  # 时间戳锚点正则表达式名称，及各值(年月日时分秒和上下午)在match对象中的位置
         self.timeRegExp = re.compile('(%s)' % self.__TimeSpecs[name], re.I) if name else None
@@ -302,7 +302,7 @@ class Anchor(object):
             else:
                 anchor_date = self.__recent_day(anchor_time)
         except ValueError as err:
-            G.log.warning('No valid Datetime detected in %s', line)
+            G.log.warning('No valid Datetime detected in %s. %s', line, str(err))
             return None
 
         anchor_timestamp = time.mktime(datetime.datetime.combine(anchor_date, anchor_time).timetuple())
@@ -368,18 +368,19 @@ class Anchor(object):
         return self.__getDateFrom(matches[1], matches[2], matches[3], matches[4])
 
     # 兼容无年份\两位年份\4位年份等情况,形成完整日期
-    def __getDateFrom(self, century, yy, mm, dd):
+    @staticmethod
+    def __getDateFrom(century, yy, mm, dd):
         mm, dd = int(mm), int(dd)
         if not yy:  # MMDD格式
             today = datetime.date.today()
-            yyyy = today.year
+            yy = today.year
             if today.month * 100 + today.day < mm * 100 + dd:
-                yyyy -= 1
+                yy -= 1
         elif not century:  # YYMMDD格式
-            yyyy = 2000 + int(yy)
+            yy = 2000 + int(yy)
         else:  # YYYYMMDD格式
-            yyyy = int(century) * 100 + yy
-        anchor_date = datetime.date(yyyy, mm, dd)
+            yy = int(century) * 100 + yy
+        anchor_date = datetime.date(yy, mm, dd)
         return anchor_date
 
 

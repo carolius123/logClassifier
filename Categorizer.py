@@ -74,8 +74,8 @@ class Categorizer(object):
             G.log.info('Model saved to %s successful.' % os.path.join(G.projectModelPath, samples_file + '.mdl'))
 
     def prepareData(self, samples_file):
-        ruleSets = FileUtil.loadRuleSets()
-        for self.ruleSet in ruleSets:
+        rule_sets = FileUtil.loadRuleSets()
+        for self.ruleSet in rule_sets:
             # 日志文件预处理为记录向量,并形成字典。vectors是稀疏矩阵(行-记录，列-词数)
             self.dictionary, vectors = self.__buildVectors(samples_file)
             if not self.dictionary:  # 字典太短，换rule set重新采样
@@ -195,7 +195,7 @@ class Categorizer(object):
         last_k = k_from + 2
 
         maxima = None  # (k, kmeans, sse, indicator)
-        prefer = (0, None, 0, 0, 0)  # (K_, kmeans, sse, indicator, ratio of top5 lables)
+        prefer = (0, None, 0, 0, 0)  # (K_, kmeans, sse, indicator, ratio of top5 labels)
         last_top5_value, last_top5_idx = 100, 1
         for k_ in range(k_from + 3, self.__MaxCategory):
             kmeans = KMeans(n_clusters=k_).fit(vectors)  # 试聚类
@@ -243,7 +243,7 @@ class Categorizer(object):
         kmeans = KMeans(n_clusters=k_, n_init=20, max_iter=500).fit(vectors)
         norm_factor = - vectors.shape[1]  # 按字典宽度归一化，保证不同模型的可比性
         groups = DataFrame({'C': kmeans.labels_, 'S': [kmeans.score([v]) / norm_factor for v in vectors]}).groupby('C')
-        alias = ['Type' + str(i) for i in range(k_)]  # 簇的别名，默认为Typei，可人工命名
+        alias = ['Type' + str(i) for i in range(k_)]  # 簇的别名，默认为rci，可人工命名
         proportions = groups.size() / len(vectors)  # 该簇向量数在聚类总向量数中的占比
         quantiles = np.array([groups.get_group(i)['S'].quantile(self.__Quantile, interpolation='higher')
                               for i in range(k_)])

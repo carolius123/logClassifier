@@ -405,4 +405,3 @@ class Classifier(object):
 if __name__ == '__main__':
     print(Classifier.__doc__)
     print('This program cannot run directly')
-
