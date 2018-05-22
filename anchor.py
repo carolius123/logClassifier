@@ -30,8 +30,13 @@ class Anchor(object):
     __TimeRegExp = re.compile('|'.join('(?P<%s>%s)' % (k_, v_) for k_, v_ in __TimeSpecs.items()), re.I)
     __MonthRegex = re.compile(r'(?<=\W)(Jan)|(Feb)|(Mar)|(Apr)|(May)|(Jun|June)|(Jul|July)|(Aug)|(Sep|Sept)'
                               r'|(Oct)|(Nov)|(Dec)(?=\W)', re.I)
-    __DateSep = r'(?P<sep>[\\/-])'
-    __HyphenDateRegex = re.compile(r'(?<!\d)(\d{1,4})' + __DateSep + '(\d{1,4})((?P=sep))(\d){1,4}(?!\d)')
+    __DateSep = r'[\\/-]'
+    __HyphenDateIdx = {'YYMMDD': (0, 2, 3), 'MMDD': (0, 1, None)}
+    __HyphenDateSpecs = {'YYMMDD': r'(?<!\d)(\d{1,4})(?P<sep>' + __DateSep + ')(\d{1,4})(?P=sep)(\d){1,4}(?!\d)',
+                         'MMDD': r'(?<!\d)([1-9]|[0-3]\d)' + __DateSep + '([1-9]|[0-3]\d)(?!\d)'
+                         }
+    __HyphenDateRegex = re.compile('|'.join('(?P<%s>%s)' % (k_, v_) for k_, v_ in __HyphenDateSpecs.items()), re.I)
+
     __DigitalDateRegex = re.compile(r'(?<!\d)((20)?([12]\d))?(0\d|1[012])([012]\d|3[01])(?!\d)')
     __PmRegex = re.compile(r'(?<=[\d\s])(pm\s|下午)(?=[\d\s])', re.I)
 
@@ -40,7 +45,8 @@ class Anchor(object):
         self.colSpan = col_span  # (搜索的开始列，结束列)
         self.name = name  # 时间戳锚点正则表达式名称，及各值(年月日时分秒和上下午)在match对象中的位置
         self.timeRegExp = re.compile('(%s)' % self.__TimeSpecs[name], re.I) if name else None
-        self.datePattern = {}  # {'left':True, 'y':0, 'm':2, 'd':4
+        self.datePattern = {}  # {'left':True, 'name':'YYHHDD', 'y':0, 'm':2, 'd':4
+        self.dateRegExp = None
 
         self.setTimeFormat(self.__getTimeData(sample_file)) if sample_file else None
         self.probeDatePattern(sample_file) if probe_date and self.name == 'COLON' else None
@@ -153,7 +159,7 @@ class Anchor(object):
                 counter += 1
                 time_span = time_.span()
                 self.__probeHyphenDate(time_span, line, results, left)
-                if len(results) >= 2 or (counter > 5 and not results):  # 很多行都没找到时间戳
+                if len(results) >= 2 or (counter > 5 and not results):  # 找够2个日期, 5个时间仍没有日期就退出
                     break
             self.__setDatePattern(results, left)
         except Exception as err:
@@ -169,6 +175,7 @@ class Anchor(object):
         start_col = 0 if start_col < 0 else start_col
 
         match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.dateMargin])
+
         if match_:
             left[True] += 1
         else:
@@ -183,13 +190,14 @@ class Anchor(object):
             results.add(disordered_date)
 
     def __setDatePattern(self, results, left):
-        if results:
-            date_mask = self.__probeDateOrder(results)
-            for i in range(3):
-                self.datePattern[date_mask[i]] = i * 2
+        if not results:  # 没有搜到日期数据
+            self.datePattern['name'] = None
+            return
 
-            date_margin = G.dateMargin
-            self.datePattern['left'] = True if left[True] > left[False] else False
+        date_pattern = self.__probeDateOrder(results)
+        self.datePattern.update(date_pattern)
+        self.dateRegExp = re.compile(self.__HyphenDateSpecs[self.datePattern['name']])
+        self.datePattern['left'] = True if left[True] > left[False] else False
 
     # 确定年月日的顺序, 依据包括：日期变化规律、4位是年、大于2位年的是日、唯一大于12的是年，唯一小于12的是月
     @staticmethod
@@ -198,50 +206,64 @@ class Anchor(object):
         unordered_dates = np.array([[int(cell) for cell in row.split('/')] for row in unordered_dates])
 
         date_value = np.max(unordered_dates, axis=0)
-        date_mask = np.array(['', '', ''])
+        date_len = unordered_dates.shape[1]
+        ymd_mask = np.array(['' for i in range(date_len)])
 
         # 先按照日期的前后变化找规律(如先后两行出现18-2-3、18-2-4)
         diff_ = (date_value - np.min(unordered_dates, axis=0))
         if np.max(diff_) > 0:  # 时间戳起码是跨天的，变化最大的一定是日
-            date_mask[diff_ == np.max(diff_)] = 'd'
+            ymd_mask[diff_ == np.max(diff_)] = 'd'
         else:  # 所有时间戳都是同一天的, 拿日期数字的值碰碰运气
             this_year = int(time.strftime('%y'))
-            date_mask[date_value > 2000] = 'y'  # 4位肯定是年份
+            ymd_mask[date_value > 2000] = 'y'  # 4位肯定是年份
             date_value[date_value > 2000] = date_value[date_value > 2000] - 2000
-            date_mask[date_value == 0] = 'y'  # 0是None转过来的，肯定是年
+            ymd_mask[date_value == 0] = 'y'  # 0是None转过来的，肯定是年
             date_value[date_value == 0] = this_year
-            date_mask[date_value > this_year] = 'd'  # 大于2位年份、小于4位年份，肯定是日
+            ymd_mask[date_value > this_year] = 'd'  # 大于2位年份、小于4位年份，肯定是日
 
-        mask_r = {v: idx for idx, v in enumerate(list(date_mask))}
-        if mask_r.get('d') is not None:  # 只要日找到，年月肯定可区分(年份数字一定大于月份数字,2013年以后）
-            date_mask[date_mask != 'd'] = ''  # 先把可能未知的年、月清零
-            date_value[date_mask == 'd'] = 0  # 比较大小前屏蔽掉已知的日
-            date_mask[date_value == np.max(date_value)] = 'y'  # 大的是年
-            date_mask[date_mask == ''] = 'm'  # 剩下的是月
+        ymd_order = {v: idx for idx, v in enumerate(list(ymd_mask))}
+        if ymd_order.get('d') is not None:  # 只要日找到，年月肯定可区分(年份数字一定大于月份数字,2013年以后）
+            ymd_mask[ymd_mask != 'd'] = ''  # 先把可能未知的年、月清零
+            date_value[ymd_mask == 'd'] = 0  # 比较大小前屏蔽掉已知的日
+            ymd_mask[date_value == np.max(date_value)] = 'y'  # 大的是年
+            ymd_mask[ymd_mask == ''] = 'm'  # 剩下的是月
         else:  # 未找到日期，所有时间戳都是同一天的, 接着检查日期数字的值
             less_than12_times = date_value[date_value <= 12].shape[0]  # 小于12的个数
             if less_than12_times == 1:
-                date_mask[date_value <= 12] = 'm'  # 唯一不大于12的是月份
+                ymd_mask[date_value <= 12] = 'm'  # 唯一不大于12的是月份
             elif less_than12_times == 2:
-                date_mask[date_value > 12] = 'y'  # 唯一大于12的是年份
+                ymd_mask[date_value > 12] = 'y'  # 唯一大于12的是年份
             elif date_value[date_value == np.max(date_value)].shape[0] == 1:  # 最大值当作年
-                date_mask[date_value == np.max(date_value)] = 'y'
+                ymd_mask[date_value == np.max(date_value)] = 'y'
 
             # 无法完全确定的，按可能性大小设置
-            mask_r = {v: idx for idx, v in enumerate(list(date_mask))}
-            if mask_r.get('m') == 0 or mask_r.get('y') == 2:
-                date_mask = np.array(['m', 'd', 'y'])
-            elif mask_r.get('m') == 2:
-                date_mask = np.array(['y', 'd', 'm'])
-            elif mask_r.get('y') == 1:
-                date_mask = np.array(['d', 'y', 'm'])
-            else:
-                date_mask = np.array(['y', 'm', 'd'])
-            G.log.warning('Failed to probe date format(only one date:%d-%d-%d), using %s instead. %s'
-                          % (date_value[0], date_value[1], date_value[2], '-'.join([x + x for x in date_mask]),
-                             filename))
+            ymd_order = {v: idx for idx, v in enumerate(list(ymd_mask))}
+            if date_len == 2:  # MMDD
+                if less_than12_times == 1:
+                    ymd_mask[date_value > 12] = 'd'  # 唯一不大于12的是月份
+                else:
+                    ymd_mask = np.array(['m', 'd'])
+                    G.log.warning('Failed to probe date format for the single date:%d-%d), using %s instead. %s'
+                                  % (date_value[0], date_value[1], '-'.join([x + x for x in ymd_mask]), filename))
+            else:  # YYMMDD
+                if ymd_order.get('m') == 0 or ymd_order.get('y') == 2:
+                    ymd_mask = np.array(['m', 'd', 'y'])
+                elif ymd_order.get('m') == 2:
+                    ymd_mask = np.array(['y', 'd', 'm'])
+                elif ymd_order.get('y') == 1:
+                    ymd_mask = np.array(['d', 'y', 'm'])
+                else:
+                    ymd_mask = np.array(['y', 'm', 'd'])
+                G.log.warning('Failed to probe date format for the single:%d-%d-%d), using %s instead. %s'
+                              % (date_value[0], date_value[1], date_value[2], '-'.join([x + x for x in ymd_mask]),
+                                 filename))
+        if date_len == 2:  # MMDD
+            ymd_mask[ymd_mask != 'd'] = 'm'  # 唯一不大于12的是月份
+        date_name = 'MMDD' if date_len == 2 else 'YYMMDD'
+        result = {v: Anchor.__HyphenDateIdx[date_name][idx] for idx, v in enumerate(ymd_mask)}
+        result['name'] = date_name
 
-        return date_mask
+        return result
 
     # 返回锚点的日期时间值
     def getTimeStamp(self, line):
@@ -256,32 +278,37 @@ class Anchor(object):
         if not time_:  # 没有搜到有效的时间戳
             return None
 
-        if self.name == 'SECONDS':
-            anchor_timestamp = float(time_.group())
-            return anchor_timestamp
+        try:
+            if self.name == 'SECONDS':
+                anchor_timestamp = float(time_.group())
+                return anchor_timestamp
 
-        v = time_.groups()
-        idx = self.__TimeIdx[self.name]
-        anchor_time = datetime.time(int(v[idx[0]]), int(v[idx[1]]), int(v[idx[2]]))
-        anchor_date = None
-        time_span = time_.span()
-        if self.name == 'COLON':
-            if not self.datePattern:  # 未probe日期或者无日期, 取今天或昨天
-                if datetime.datetime.today().time() > anchor_time:
-                    anchor_date = datetime.date.today()
-                else:
-                    anchor_date = datetime.date.today() - datetime.timedelta(days=1)
-            else:
-                anchor_date = self.__getHyphenDate(time_span, line)
+            matches = time_.groups()
+            time_idx = self.__TimeIdx[self.name]
+            anchor_time = datetime.time(int(matches[time_idx[0]]), int(matches[time_idx[1]]), int(matches[time_idx[2]]))
+
+            time_span = time_.span()
+            if self.name == 'COLON':
+                anchor_date = self.__getHyphenDate(time_span, line) if self.datePattern else self.__recent_day(
+                    anchor_time)
+                if not anchor_date:
+                    return None
                 if self.__isAfternoon(time_span, line):
                     anchor_date += datetime.timedelta(hours=12)
-        elif self.name == 'HHMMSS':
-            anchor_date = self.__getDigitDate(time_span, line)
+            elif self.name == 'HHMMSS':
+                anchor_date = self.__getDigitDate(time_span, line)
+                if not anchor_date:
+                    return None
+            else:
+                anchor_date = self.__recent_day(anchor_time)
+        except ValueError as err:
+            G.log.warning('No valid Datetime detected in %s', line)
+            return None
 
         anchor_timestamp = time.mktime(datetime.datetime.combine(anchor_date, anchor_time).timetuple())
-
         return anchor_timestamp
 
+    # 在时间左侧或者右侧搜索并提取以/\-等分隔的日期
     def __getHyphenDate(self, time_span, line):
         base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
         line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex), line)
@@ -289,15 +316,33 @@ class Anchor(object):
 
         start_col = base_col + time_span[0] - G.dateMargin if self.datePattern['left'] else base_col + time_span[1]
         start_col = 0 if start_col < 0 else start_col
-        match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.dateMargin])
+        match_ = self.dateRegExp.search(line[start_col:start_col + G.dateMargin])
         if not match_:
             return None
-        v = match_.groups()
-        year = int(v[self.datePattern['y']])
-        year += 2000 if year < 100 else 0
-        anchor_date = datetime.date(year, int(v[self.datePattern['m']]), int(v[self.datePattern['d']]))
+        matches = match_.groups()
+        mm, dd = int(matches[self.datePattern['m']]), int(matches[self.datePattern['d']])
+        y = self.datePattern.get('y', None)
+        if y is None:
+            today = datetime.date.today()
+            yy = today.year
+            if today.month * 100 + today.day < mm * 100 + dd:
+                yy -= 1
+        else:
+            yy = int(matches[y])
+            yy += 2000 if yy < 100 else 0
+
+        anchor_date = datetime.date(yy, mm, dd)
         return anchor_date
 
+    # 取距离time_最近今天或昨天
+    @staticmethod
+    def __recent_day(time_):
+        date_ = datetime.date.today()
+        if datetime.datetime.today().time() < time_:
+            date_ -= datetime.timedelta(days=1)
+        return date_
+
+    # 在时间左侧及右侧搜索是否存在'pm/下午'等字符
     def __isAfternoon(self, time_span, line):
         base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
         start_col = base_col + time_span[0] - 5
@@ -310,6 +355,7 @@ class Anchor(object):
             return True
         return False
 
+    # 在时间左侧搜索并提取YYYYMMDD/YYMMDD/MMDD格式日期
     def __getDigitDate(self, time_span, line):
         base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
         start_col = base_col + time_span[0] - 10
@@ -318,18 +364,31 @@ class Anchor(object):
         if not match_:
             return None
 
-        v = match_.groups()
-        yy = 0 if v[1] is None else int(v[1]) * 100
-        yy += int(v[2])
-        anchor_date = datetime.date(yy, int(v[3]), int(v[4]))
+        matches = match_.groups()
+        return self.__getDateFrom(matches[1], matches[2], matches[3], matches[4])
+
+    # 兼容无年份\两位年份\4位年份等情况,形成完整日期
+    def __getDateFrom(self, century, yy, mm, dd):
+        mm, dd = int(mm), int(dd)
+        if not yy:  # MMDD格式
+            today = datetime.date.today()
+            yyyy = today.year
+            if today.month * 100 + today.day < mm * 100 + dd:
+                yyyy -= 1
+        elif not century:  # YYMMDD格式
+            yyyy = 2000 + int(yy)
+        else:  # YYYYMMDD格式
+            yyyy = int(century) * 100 + yy
+        anchor_date = datetime.date(yyyy, mm, dd)
         return anchor_date
 
 
 if __name__ == '__main__':
     import os
 
-    def __run():
-        file_or_path = 'D:\\home\\chinalife\\10.20.100.10\\zabbix\\log\\zabbix_agentd.log'
+
+    def run():
+        file_or_path = 'D:\\home\\t.txt'
         #            input('input a path or full file name:')
         if not file_or_path.strip():
             return False
@@ -337,17 +396,17 @@ if __name__ == '__main__':
             return True
         if os.path.isfile(file_or_path):
             file_fullname = file_or_path
-            __process(file_fullname)
+            process(file_fullname)
             return True
 
         for dir_path, dir_names, file_names in os.walk(file_or_path):
             for filename in file_names:
                 file_fullname = os.path.join(dir_path, filename)
-                __process(file_fullname)
+                process(file_fullname)
         return True
 
 
-    def __process(file_fullname):
+    def process(file_fullname):
         filename = os.path.split(file_fullname)[1]
         try:
             a = Anchor(file_fullname, probe_date=True)
@@ -358,5 +417,5 @@ if __name__ == '__main__':
             G.log.error('%s\t%s\tERROR\t%s' % (filename, file_fullname, str(e)))
 
 
-    while __run():
+    while run():
         pass

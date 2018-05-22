@@ -267,13 +267,13 @@ class Categorizer(object):
                     os.path.join(G.projectModelPath, samples_file + '.mdl'))  # 保存模型，供后续使用
         self.dictionary.save_as_text(os.path.join(G.logsPath, samples_file + '.dic.csv'))  # 保存文本字典，供人工审查
         df = DataFrame({'类型': self.alias, '样本占比': self.percent, '分位点距离': self.quantile, '边界-分位点距离': self.boundary})
-        df.to_csv(os.path.join(G.logsPath, samples_file + '.mdl.csv'), sep='\t')  # 保存聚类模型，供人工审查
+        df.to_csv(os.path.join(G.logsPath, samples_file + '.mdl.csv'), sep='\t', encoding='GBK')  # 保存聚类模型，供人工审查
 
         df = DataFrame(columns=('时间', '记录分类', '置信度', '记录内容', '记录词汇'))
         for idx, (timestamp, _, c_name, confidence, _, record, words) in enumerate(self.predict(samples_file_fullname)):
             date_time = strftime('%Y-%m-%d %H:%M:%S', localtime(timestamp))
             df.loc[idx] = date_time, c_name, confidence, record, words
-        df.to_csv(os.path.join(G.logsPath, samples_file + '.out.csv'), sep='\t')
+        df.to_csv(os.path.join(G.logsPath, samples_file + '.out.csv'), sep='\t', encoding='GBK')
 
     # predict from txt file or txt data flow
     def predict(self, data_stream):
