@@ -51,43 +51,42 @@ class RecordClassifier(object):
     __MaxCategory = G.cfg.getint('RecordCluster', 'MaxCategory')  # 尝试聚类的最大类别，以降低计算量
     __Quantile = G.cfg.getfloat('RecordCluster', 'Quantile')  # 类别的边界，该类中以该值为分位数的点，作为该类的边界
 
-    def __init__(self, samples_file='', anchor=None, model_file=''):
-        self.anchor = anchor  # 时间戳锚点Anchor
+    def __init__(self, model_file='', samples_file='', anchor=None):
         self.ruleSet = None  # 处理文件正则表达式
         self.dictionary = None  # 字典Dictionary
-        self.model = None  # 聚类模型 KMeans
+        self.models = None  # 聚类模型 KMeans
         self.alias = None  # cluster名称
         self.percent = None  # 该类别数量占比
-        self.boundary = None  # 最远点到(0.8)分位点距离平方
-        self.quantile = None  # (0.8)分位点到中心点距离平方
+        self.boundaries = None  # 最远点到(0.8)分位点距离平方
+        self.quantiles = None  # (0.8)分位点到中心点距离平方
+        self.anchor = anchor  # 时间戳锚点Anchor
 
         if os.path.exists(model_file):  # 从模型文件装载模型
-            model = joblib.load(model_file)
-            self.anchor, self.ruleSe, self.dictionary, self.model, self.alias, self.percent, self.boundary, self.quantile = model
+            self.anchor, self.ruleSe, self.dictionary, self.models, self.alias, self.percent, self.boundaries, self.quantiles = joblib.load(
+                model_file)
 
         if os.path.exists(samples_file):  # 从样本训练模型
-            self.anchor = Anchor(samples_file) if not anchor else None  # 从样本文件中提取时间戳锚点
-            preferred_k, vectors = self.prepareData(samples_file)
-            self.model, self.percent, self.boundary, self.quantile = FileUtil.buildModel(preferred_k, vectors)
-            self.__saveModel(samples_file)
-            G.log.info('Model saved to %s successful.' % os.path.join(G.projectModelPath, samples_file + '.mdl'))
+            if not self.anchor:  # 从样本文件中提取时间戳锚点
+                self.anchor = Anchor(samples_file, probe_date=True)
+            self.buildModel(samples_file)
 
-    def prepareData(self, samples_file):
-        rule_sets = FileUtil.loadRuleSets()
-        for self.ruleSet in rule_sets:
+    def buildModel(self, samples_file):
+        for self.ruleSet in FileUtil.loadRuleSets():
             # 日志文件预处理为记录向量,并形成字典。vectors是稀疏矩阵(行-记录，列-词数)
             self.dictionary, vectors = self.__buildVectors(samples_file)
             if not self.dictionary:  # 字典太短，换rule set重新采样
                 continue
-            #            start_k = self.__findStartK(vectors)  # 快速定位符合分布相对均衡的起点K
-            #            if not start_k:  # 聚类不均衡，换rule set重新采样
-            #                continue
             start_k = int(min(len(self.dictionary) / 10, vectors.shape[0] / 100))
-            preferred_k = FileUtil.pilotClustering('RecordCluster', vectors, start_k)  # 多个K值试聚类，返回最佳K
-            if preferred_k:  # 找到合适的K，跳出循环, 否则换rule set重新采样
-                return preferred_k, vectors
+            k_ = FileUtil.pilotClustering('RecordCluster', vectors, start_k)  # 多个K值试聚类，返回最佳K
+            if k_:  # 找到合适的K，跳出循环, 否则换rule set重新采样
+                break
         else:
             raise UserWarning('Cannot generate qualified corpus by all RuleSets')
+
+        self.models, self.percent, self.boundaries, self.quantiles = FileUtil.buildModel('RecordCluster', k_, vectors)
+        self.__saveModel(samples_file)
+        G.log.info('Model saved to %s successful.' % os.path.join(G.projectModelPath, samples_file + '.mdl'))
+
     # 文档向量化。dataset-[document:M]-[[word]]-[[token]]-[BoW:M]-corpus-tfidf-dictionary:N, [vector:M*N]
     def __buildVectors(self, samples_file):
         lines = 0
@@ -96,8 +95,7 @@ class RecordClassifier(object):
         for doc_idx, (document, lines) in enumerate(self.__buildDocument(samples_file)):
             dct.add_documents([document])
             tmp_file.write(' '.join(document) + '\n')
-            if doc_idx % 500 == 0:
-                G.log.debug('Processed %d records in %s', doc_idx, samples_file)
+            if doc_idx % 500 == 0: G.log.debug('Processed %d records in %s', doc_idx, samples_file)
         if dct.num_docs < self.__LeastDocuments:  # 字典字数太少或文档数太少，没必要聚类
             tmp_file.close()
             raise UserWarning('Too few records[%d]' % dct.num_docs)
@@ -125,6 +123,7 @@ class RecordClassifier(object):
             dct.num_docs, len(dct), dct.num_nnz * 100 / len(dct) / dct.num_docs))
         tmp_file.close()
         return dct, vectors
+
     # 预处理文件，迭代方式返回某条记录的词表.
     def __buildDocument(self, samples_file):
         line_idx, record = 0, ''
@@ -152,34 +151,8 @@ class RecordClassifier(object):
             except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
                 G.log.exception('Record [%s] ignored due to the following error:', record)
         raise StopIteration()
-    # 从k=64开始，二分法确定Top5类样本量小于指定比例的K
-    def __findStartK( self, vectors ):
-        k_from, k_, k_to = 1, 64, 0
-        while k_ < min(self.__MaxCategory, len(vectors)):
-            kmeans = KMeans(n_clusters=k_).fit(vectors)  # 聚类
-            n = min(5, int(k_ * 0.1) + 1)
-            top5_ratio = sum([v for (k, v) in Counter(kmeans.labels_).most_common(n)]) / vectors.shape[0]
-            G.log.debug('locating the starter . k=%d, SSE= %f, Top%d labels=%d%%', k_, kmeans.inertia_, n,
-                        top5_ratio * 100)
 
-            if top5_ratio < self.__Top5Ratio:  # 向前找
-                if k_ - k_from < 4:  # 已靠近低限，找到大致起点
-                    G.log.info('start k=%d', k_from)
-                    return k_from
-                k_to = k_ - 1
-                k_ = k_from + int((k_ - k_from) / 2)
-            else:  # 向后找
-                if k_ < k_to < k_ + 4:  # 已靠近高点，找到大致起点
-                    G.log.info('start k=%d', k_)
-                    return k_
-                k_from = k_ + 1
-                k_ = k_to - int((k_to - k_) / 2) if k_to > 0 else k_ * 2
 
-            if kmeans.inertia_ < 1e-5:  # 已经完全分类，但仍不均衡
-                break
-
-        G.log.info('No starter K found')
-        return None  # No found,re-samples
     # 聚类，得到各簇SSE（sum of the squared errors)，作为手肘法评估确定ｋ的依据
     def __pilotClustering( self, vectors, k_from=1 ):
         cell_norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度归一化
@@ -253,19 +226,19 @@ class RecordClassifier(object):
             elif boundaries[i] == 0:  # 避免出现0/0
                 boundaries[i] = 1e-100
 
-        G.log.info('Model(k=%d) built. inertia=%.3f， max proportion=%.2f%%, max quantile=%.3f, max border=%.3f',
+        G.log.info('Model(k=%d) built. inertia=%.3f， max proportion=%.2f%%, max quantiles=%.3f, max border=%.3f',
                    k_, kmeans.inertia_, max(proportions) * 100, max(quantiles), max(boundaries))
         return kmeans, alias, proportions, boundaries, quantiles
 
     # 保存模型和结果
     def __saveModel(self, samples_file_fullname):
         samples_file = os.path.splitext(os.path.split(samples_file_fullname)[1])[0]
-        self.alias = ['rc' + str(i) for i in range(len(self.quantile))]  # 簇的别名，默认为rci，可人工命名
-        joblib.dump((self.anchor, self.ruleSet, self.dictionary, self.model, self.alias, self.percent,
-                     self.boundary, self.quantile),
+        self.alias = ['rc' + str(i) for i in range(len(self.quantiles))]  # 簇的别名，默认为rci，可人工命名
+        joblib.dump((self.anchor, self.ruleSet, self.dictionary, self.models, self.alias, self.percent,
+                     self.boundaries, self.quantiles),
                     os.path.join(G.projectModelPath, samples_file + '.mdl'))  # 保存模型，供后续使用
         self.dictionary.save_as_text(os.path.join(G.logsPath, samples_file + '.dic.csv'))  # 保存文本字典，供人工审查
-        df = DataFrame({'类型': self.alias, '样本占比': self.percent, '分位点距离': self.quantile, '边界-分位点距离': self.boundary})
+        df = DataFrame({'类型': self.alias, '样本占比': self.percent, '分位点距离': self.quantiles, '边界-分位点距离': self.boundaries})
         df.to_csv(os.path.join(G.logsPath, samples_file + '.mdl.csv'), sep='\t', encoding='GBK')  # 保存聚类模型，供人工审查
 
         df = DataFrame(columns=('时间', '记录分类', '置信度', '记录内容', '记录词汇'))
@@ -282,7 +255,7 @@ class RecordClassifier(object):
         :param data_stream: samples file name or data stream
         :return: records [[category_id、category_alias, confidence, timestamp, record, bag_of_word]]
         """
-        if not self.model:
+        if not self.models:
             raise UserWarning('Failed to predict: Model is not exist!')
 
         if type(data_stream) is str:  # 如输入文件名，读取内容，得到dataset
@@ -322,8 +295,8 @@ class RecordClassifier(object):
     def __predictRecord(self, timestamp, record):
         words = G.getWords(record, rule_set=self.ruleSet)  # 完整记录Record(变量替换/停用词/分词/Kshingle)-〉[word]
         vectors = self.__getVectors([words])  # 计算向量[vector:Record*dictionary]
-        c_ids, c_names, confidences, distances = FileUtil.getPredictResult(self.model, self.alias, self.boundary,
-                                                                           self.quantile, vectors)
+        c_ids, c_names, confidences, distances = FileUtil.getPredictResult(self.models, self.alias, self.boundaries,
+                                                                           self.quantiles, vectors)
         return timestamp, c_ids[0], c_names[0], confidences[0], distances[0], record, words
 
     # 构造不归一的IF_IDF词袋和文档向量
@@ -344,7 +317,7 @@ if __name__ == '__main__':
             filename = os.path.join(G.l2_cache, filename)
             if os.path.isfile(filename):
                 G.log.info('[%d]%s: Record classifying...', index, filename)
-                rc = RecordClassifier(filename)
+                rc = RecordClassifier(samples_file=filename)
         except Exception as err:
             errors += 1
             G.log.error('%s ignored due to: %s', filename, str(err))

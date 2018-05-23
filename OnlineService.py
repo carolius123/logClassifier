@@ -29,7 +29,7 @@ class OnlineService(object):
         self.models = []
         for model_file in [G.productFileClassifierModel, G.projectFileClassifierModel]:
             if os.path.exists(model_file):
-                model = FileClassifier(model_file=model_file)
+                model = FileClassifier(model_file)
             else:
                 model = None
             self.models.append(model)

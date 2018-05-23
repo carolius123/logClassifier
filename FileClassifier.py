@@ -1,19 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# @File  : FileClassifier.pyfierModel.py
+# @File  : FileClassifier.py
 # @Author: Sui Huafeng
 # @Date  : 2018/4
 # @Desc  : 从$DATA/input中所有样本文件中训练一个日志文件分类器
 #
 
 import os
-from collections import Counter
 
 import numpy as np
 import pandas as pd
 from gensim.corpora import Dictionary
 from gensim.models import TfidfModel
-from sklearn.cluster import KMeans
 from sklearn.externals import joblib
 
 from config import Workspaces as G
@@ -23,48 +21,43 @@ from utilites import Dbc, FileUtil, DbUtil
 # 对数十、上百万个文件进行聚类，形成聚类模型
 class FileClassifier(object):
     """
-    新建对象或者调用reCluster方法，可以对$DATA/l0cache/重新聚类生成fc模型
-    调用predictFile或PredictFiles方法，可以预测新的日志文件类型及其置信度
-    $DATA/l0cache/: 存储各样本文件。目录结构就是被管服务器原始结构
+    以目录名为参数创建对象,或者调用buildModel方法, 以该目录下文件作为样本聚类生成fc模型
+    以文件名为参数创建对象或者调用loadModel方法，可装载fc模型
+    调用predictFile或predictFiles方法, 可以预测新的日志文件类型及其置信度
     """
     __corpusCacheFile = os.path.join(G.projectModelPath, 'corpuscache.1')
     l1_dbf = os.path.join(G.projectModelPath, 'metadata.1')
 
-    def __init__(self, model_file=''):
-        self.model_file = model_file
-        self.model_id = 0 if model_file == G.productFileClassifierModel else 1
-        self.common_filenames, self.l1_structure = ([], [])
+    def __init__(self, model_file_or_samples_path):
         self.ruleSet = None  # 处理文件正则表达式
-        self.statsScope = None  # 样本文件字符数、字数统计值(均值、标准差、中位数)的最小-最大值范围
         self.dictionary = None  # 字典对象(Gensim Dictionary)
-        self.model = None  # 聚类模型(Kmeans)
-        self.categories = None  # 聚类的类型(名称，数量占比，分位点距离，边界点距离)
-        self.db = None
-        self.cursor = None
+        self.statsScope = None  # 样本文件字符数、字数统计值(均值、标准差、中位数)的最小-最大值范围
+        self.models = None  # 聚类模型(Kmeans)
+        self.categories = None  # 聚类的类型[[名称]，[数量占比]，[分位点距离]，[边界点距离]]
+        self.model_id = 1
+        self.common_filenames, self.l1_structure = ([], [])
 
-        if os.path.exists(model_file):  # 从模型文件装载模型
-            self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories = joblib.load(model_file)
-            self.__dbUpdCategories()
+        if os.path.isfile(model_file_or_samples_path):  # 从模型文件装载模型
+            self.loadModel(model_file_or_samples_path)
+        elif os.path.isdir(model_file_or_samples_path):
+            self.buildModel()
         else:
-            G.log.warning('No model loaded!')
+            G.log.warning('No models loaded!')
 
-    # 重新训练模型
-    def reCluster(self):
-        self.db = DbUtil.dbConnect()
-        self.cursor = self.db.cursor() if self.db else None
+    def loadModel(self, model_file=G.projectFileClassifierModel):
+        self.ruleSet, self.dictionary, self.statsScope, self.models, self.categories = joblib.load(model_file)
+        if model_file == G.productFileClassifierModel:
+            self.model_id = 0
+        self.__dbUpdCategories()
 
-        results = self.trainModel()
-        self.__saveModel()  # model saved to file
-
-        if self.cursor:
-            file_and_results = [self.common_filenames] + list(results)
-            classified_common_files, unclassified_common_files = FileUtil.splitResults(self.model_id, file_and_results)
-            DbUtil.dbUdFilesMerged(self.cursor, classified_common_files, unclassified_common_files)
-            FileUtil.mergeFilesByClass(self.cursor, G.l2_cache)  # 同类文件合并到to_目录下
-            wildcard_log_files = FileUtil.genGatherList(self.cursor)  # 生成采集文件列表
-            DbUtil.dbWildcardLogFiles(self.cursor, wildcard_log_files)
-            self.db.commit()
-            self.db.close()
+    def __dbUpdCategories(self):
+        with Dbc() as cursor:
+            c = self.categories
+            for category_id, (name, percent, boundary, quantile) in enumerate(zip(c[0], c[1], c[2], c[3])):
+                name = '"%s"' % name
+                sql = 'INSERT INTO file_class (model_id, category_id, name, quantile, boundary, percent) VALUES(%d, %d, %s, %e,%e, %f) ON DUPLICATE KEY UPDATE name=%s,quantile=%e,boundary=%e,percent=%f' % (
+                    self.model_id, category_id, name, quantile, boundary, percent, name, quantile, boundary, percent)
+                cursor.execute(sql)
 
     def __iter__(self):
         self.category_id = 0
@@ -96,43 +89,44 @@ class FileClassifier(object):
         self.__saveModel()
 
     # 训练、生成模型并保存在$models/xxx.mdl中,dataset:绝对/相对路径样本文件名，或者可迭代样本字符流
-    def trainModel(self, dataset_path=G.l1_cache, k_=0):
+    def buildModel(self, from_path=G.l1_cache, k_=0):
         """
         Train and generate K-Means Model
-        :param dataset_path: source path contains merged log files, or iterable char stream
+        :param from_path: source path contains merged log files
         :param k_: K-means parameter, 0 means auto detect
         """
-        rule_sets = FileUtil.loadRuleSets()
-        # 尝试不同的向量化规则，确定聚类数量K
-        for self.ruleSet in rule_sets:
-            corpus_fp = self.__buildDictionary(dataset_path)  # 建立字典，返回文档结构信息
+        # 尝试不同的向量化规则，确定聚类数量K_
+        for self.ruleSet in FileUtil.loadRuleSets():
+            corpus_cache_fp = self.__buildDictionary(from_path)  # 建立字典self.dictionary，返回语料缓存文件
             if len(self.dictionary) < G.cfg.getint('Classifier', 'LeastTokens'):  # 字典字数太少,重新采样
-                corpus_fp.close()
+                corpus_cache_fp.close()
                 self.__clearCache()
                 G.log.info('Too few tokens[%d], Re-sample with next RuleSet.', len(self.dictionary))
                 continue
-            corpus_fp.seek(0)
-            vectors = self.__buildVectors(corpus_fp, self.dictionary.num_docs)  # 建立稀疏矩阵doc*(dct + stats)
-            corpus_fp.close()  # 关闭缓存文件
-
-            #            start_k = self.__findStartK(vectors)  # 快速定位符合分布相对均衡的起点K
-            #            if start_k is None:  # 聚类不均衡，换rule set重新采样
-            #                continue
-
+            corpus_cache_fp.seek(0)
+            vectors = self.__buildVectors(corpus_cache_fp, self.dictionary.num_docs)  # 建立稀疏矩阵doc*(dct + stats)
+            corpus_cache_fp.close()  # 关闭缓存文件
             start_k = min(50, int(vectors.shape[0] / 100))
             k_ = k_ if k_ else FileUtil.pilotClustering('Classifier', vectors, start_k)  # 多个K值试聚类，返回最佳K
             if k_ != 0:  # 找到合适的K，跳出循环
                 break
-            self.__clearCache()  # 清除缓存的ruleset
+            self.__clearCache()  # 清除缓存的corpus_cache_file
         else:
             raise UserWarning('Cannot generate qualified corpus by all RuleSets')
-
         # 重新聚类, 得到模型(向量数、中心点和距离）和分类(向量-所属类)
-        self.model, percents, boundaries, quantiles = FileUtil.buildModel(k_, vectors)
+        self.models, percents, boundaries, quantiles = FileUtil.buildModel('Classifier', k_, vectors)
         names = ['fc%d' % i for i in range(len(percents))]
         self.categories = [names, percents, boundaries, quantiles]
         results = self.__getResult(vectors)
-        return results
+        # 保存模型文件和数据库
+        self.__saveModel()  # models saved to file
+        with Dbc() as cursor:
+            file_and_results = [self.common_filenames] + list(results)
+            classified_common_files, unclassified_common_files = FileUtil.splitResults(self.model_id, file_and_results)
+            DbUtil.dbUdFilesMerged(cursor, classified_common_files, unclassified_common_files)
+            FileUtil.mergeFilesByClass(cursor, G.l2_cache)  # 同类文件合并到to_目录下
+            wildcard_log_files = FileUtil.genGatherList(cursor)  # 生成采集文件列表
+            DbUtil.dbWildcardLogFiles(cursor, wildcard_log_files)
 
     # 建立词典，同时缓存词表文件
     def __buildDictionary(self, new_dataset_path):
@@ -171,8 +165,7 @@ class FileClassifier(object):
         statistics = np.array(self.l1_structure)[:, 1:7]
         statistics[statistics > 500] = 500  # 防止异常大的数干扰效果
         self.statsScope = np.min(statistics, axis=0), np.max(statistics, axis=0)
-        joblib.dump((self.ruleSet, self.common_filenames, self.l1_structure, self.statsScope),
-                    self.l1_dbf)  # 保存模型，供后续使用
+        joblib.dump((self.ruleSet, self.common_filenames, self.l1_structure, self.statsScope), self.l1_dbf)
 
         return cache_fp
 
@@ -182,6 +175,8 @@ class FileClassifier(object):
         G.log.info('Start Converting documents from ' + dataset_path)
         processed_files = os.path.join(G.projectModelPath, 'buildDocument.dbf')
         processed = [] if not os.path.exists(processed_files) else joblib.load(processed_files)
+        db = DbUtil.dbConnect()
+        cursor = db.cursor() if db else None
 
         for dir_path, dir_names, file_names in os.walk(dataset_path):
             for file_name in file_names:
@@ -193,7 +188,7 @@ class FileClassifier(object):
                     if amount_files % 50 == 0:
                         G.log.info('Converted %d[%d failed] files:\t%s', amount_files, failed_files, file_fullname)
                     processed.append(file_fullname)
-                    if self.__hasClassified(file_fullname):
+                    if self.__hasClassified(cursor, file_fullname):
                         continue
 
                     yield self.__file2doc(file_fullname)
@@ -202,17 +197,20 @@ class FileClassifier(object):
                     G.log.warning('Failed to convert\t%s, ignored.\t%s', file_fullname, str(err))
                     continue
         joblib.dump(processed, processed_files)
+        cursor.close()
+        db.close()
         G.log.info('Converted %d files,%d failed', amount_files, failed_files)
         raise StopIteration()
 
     # 检查是否已经分过类
-    def __hasClassified(self, common_name):
-        if not self.cursor:
+    @staticmethod
+    def __hasClassified(cursor, common_name):
+        if not cursor:
             return None
         common_name = '"%s"' % common_name.replace('\\', '/')
         sql = 'SELECT common_name FROM files_merged WHERE common_name=%s And files_merged.category_id IS NOT NULL' % common_name
-        self.cursor.execute(sql)
-        result = self.cursor.fetchone()
+        cursor.execute(sql)
+        result = cursor.fetchone()
         return result
 
     # 使用规则集匹配和转换后，转化为词表
@@ -272,42 +270,9 @@ class FileClassifier(object):
 
         return np.hstack((statistics, subtotal, vectors))
 
-    # 从k=64开始，二分法确定Top5类样本量小于指定比例的K
-    @staticmethod
-    def __findStartK(vectors):
-        k_from, k_, k_to = 5, 64, 0
-        while k_ < min(G.cfg.getint('Classifier', 'MaxCategory'), len(vectors)):
-            kmeans = KMeans(n_clusters=k_).fit(vectors)  # 聚类
-            n = min(5, int(k_ * 0.1) + 1)
-            top5_ratio = sum([v for (k, v) in Counter(kmeans.labels_).most_common(n)]) / vectors.shape[0]
-            G.log.debug('locating the starter. k=%d, SSE= %e, Top%d labels=%d%%',
-                        k_, kmeans.inertia_, n, top5_ratio * 100)
-
-            if top5_ratio < G.cfg.getfloat('Classifier', 'Top5Ratio'):  # 向前找
-                if k_ - k_from < 4:  # 已靠近低限，找到大致起点
-                    G.log.info('start k=%d', k_from)
-                    return k_from
-                k_to = k_ - 1
-                k_ = k_from + int((k_ - k_from) / 2)
-            else:  # 向后找
-                if k_ < k_to < k_ + 4:  # 已靠近高点，找到大致起点
-                    G.log.info('start k=%d', k_)
-                    return k_
-                k_from = k_ + 1
-                if k_to > 0:  # 有上限
-                    k_ = k_to - int((k_to - k_) / 2)
-                else:  # 无上限
-                    k_ *= 2
-
-            if kmeans.inertia_ < 1e-5:  # 已经完全分类，但仍不均衡
-                break
-
-        G.log.info('No starter found')
-        return None  # No found,re-samples
-
-    # 保存文本格式模型
+    # 保存模型到G.projectFileClassifierModel
     def __saveModel(self):
-        joblib.dump((self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories),
+        joblib.dump((self.ruleSet, self.dictionary, self.statsScope, self.models, self.categories),
                     G.projectFileClassifierModel)
         self.__dbUpdCategories()
         self.dictionary.save_as_text(os.path.join(G.logsPath, 'FileDictionary.csv'))
@@ -315,18 +280,8 @@ class FileClassifier(object):
         l2_fd = pd.DataFrame({'类名': category_names, '占比': percents,
                               '分位点到边界': quantiles, '边界点': boundaries})
         l2_fd.to_csv(os.path.join(G.logsPath, 'FileCategories.csv'), sep='\t', encoding='GBK')
-        G.log.info(
-            'Model is built and saved to %s, %s and Database: FileDictionary.csv, FileCategories.csv successful.',
-            G.projectFileClassifierModel, G.logsPath)
-
-    def __dbUpdCategories(self):
-        with Dbc() as cursor:
-            c = self.categories
-            for category_id, (name, percent, boundary, quantile) in enumerate(zip(c[0], c[1], c[2], c[3])):
-                name = '"%s"' % name
-                sql = 'INSERT INTO file_class (model_id, category_id, name, quantile, boundary, percent) VALUES(%d, %d, %s, %e,%e, %f) ON DUPLICATE KEY UPDATE name=%s,quantile=%e,boundary=%e,percent=%f' % (
-                    self.model_id, category_id, name, quantile, boundary, percent, name, quantile, boundary, percent)
-                cursor.execute(sql)
+        G.log.info('Model is built and saved to %s, %s: FileDictionary.csv, FileCategories.csv successful.',
+                   G.projectFileClassifierModel, G.logsPath)
 
     # 对单个样本文件进行分类，返回文件名称、时间戳锚点位置，类别和置信度
     def predictFile(self, file_fullname, encoding='utf-8'):
@@ -335,9 +290,9 @@ class FileClassifier(object):
         :param encoding: encoding of the file
         :return: None if file __process errors, tuple of filename, number-of-lines, timestamp-cols, predict category
                  index, name, confidence and distance-to-center.
-                 confidence > 1 means nearer than 0.8-quantile to the center, < 0 means out of boundary
+                 confidence > 1 means nearer than 0.8-quantiles to the center, < 0 means out of boundaries
         """
-        if self.model is None:
+        if self.models is None:
             raise UserWarning('Failed to predict: Model is not exist!')
 
         try:
@@ -356,9 +311,9 @@ class FileClassifier(object):
         :param dataset_path: path which contains filed to be predicted
         :param encoding: encoding of the file
         :return: list of file-names, number-of-line, timestamp-col, predict category index, name, confidence and
-                 distance-center. confidence > 1 means nearer than 0.8-quantile to the center, < 0 means out of boundary
+                 distance-center. confidence > 1 means nearer than 0.8-quantiles to the center, < 0 means out of boundaries
         """
-        if self.model is None:
+        if self.models is None:
             raise UserWarning('Failed to predict: Model is not exist!')
 
         corpus = []
@@ -389,7 +344,7 @@ class FileClassifier(object):
     # 预测分类并计算可信度。<0 表示超出边界，完全不对，〉1完全表示比分位点还近，非常可信
     def __getResult(self, vectors):
         c_names, _, c_boundaries, c_quantiles = self.categories
-        return FileUtil.getPredictResult(self.model, c_names, c_boundaries, c_quantiles, vectors)
+        return FileUtil.getPredictResult(self.models, c_names, c_boundaries, c_quantiles, vectors)
 
     # 删除缓存文件
     def __clearCache(self):
@@ -405,3 +360,5 @@ class FileClassifier(object):
 if __name__ == '__main__':
     print(FileClassifier.__name__, FileClassifier.__doc__)
     print('This program cannot run directly')
+    fc2 = FileClassifier(G.l1_cache)
+    fc1 = FileClassifier(G.projectFileClassifierModel)

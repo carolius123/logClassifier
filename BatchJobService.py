@@ -11,6 +11,7 @@ import threading
 import time
 
 from FileClassifier import FileClassifier
+from RecordClassifier import RecordClassifier
 from config import Workspaces as G
 from utilites import Dbc, FileUtil, DbUtil
 
@@ -25,16 +26,13 @@ class BatchJobService(object):
         self.models = []
         for model_file in [G.productFileClassifierModel, G.projectFileClassifierModel]:
             if os.path.exists(model_file):
-                model = FileClassifier(model_file=model_file)
+                model = FileClassifier(model_file)
             else:
                 model = None
             self.models.append(model)
 
-        self.reInitialization()
-
         self.interval = G.cfg.getfloat('BatchJobService', 'IntervalMinutes') * 60
         self.db, self.cursor = None, None
-        self.run()
 
     def run(self):
         self.db = DbUtil.dbConnect()
@@ -120,13 +118,28 @@ class BatchJobService(object):
         """
         self.__clearModelAndConfig()
         FileUtil.mergeFilesByName(G.l0_inputs, G.l1_cache)
-        product_model = FileClassifier(model_file=G.productFileClassifierModel)
-        if product_model.model:
+        product_model = FileClassifier(G.productFileClassifierModel)
+        if product_model.models:
             self.__reClassifyAllSamples(product_model)
-        project_model = FileClassifier()
-        project_model.reCluster()
-
+        project_model = FileClassifier(G.l1_cache)
         self.models = [product_model, project_model]
+        self.__buildRcModels(G.l2_cache)
+
+    @staticmethod
+    def __buildRcModels(from_path):
+        errors = 0
+        filename, index = '', 0
+        for index, filename in enumerate(os.listdir(from_path)):
+            try:
+                filename = os.path.join(from_path, filename)
+                if os.path.isfile(filename):
+                    G.log.info('[%d]%s: Record classifying...', index, filename)
+                    RecordClassifier(samples_file=filename)
+            except Exception as err:
+                errors += 1
+                G.log.error('%s ignored due to: %s', filename, str(err))
+                continue
+        G.log.info('%d models built and stored in %s, %d failed.', G.projectModelPath, index + 1 - errors, errors)
 
     @staticmethod
     def __clearModelAndConfig():
@@ -146,7 +159,7 @@ class BatchJobService(object):
 
     @staticmethod
     def __reClassifyAllSamples(model):
-        G.log.info('Classifying files in %s by model %s', G.l1_cache, G.productFileClassifierModel)
+        G.log.info('Classifying files in %s by models %s', G.l1_cache, G.productFileClassifierModel)
         results = model.predictFiles(G.l1_cache)
         classified_common_files, unclassified_common_files = FileUtil.splitResults(model.model_id, results)
         with Dbc() as cursor:
@@ -154,4 +167,6 @@ class BatchJobService(object):
 
 
 if __name__ == '__main__':
-    BatchJobService()
+    bcs = BatchJobService()
+    bcs.reInitialization()
+    bcs.run()

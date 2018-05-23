@@ -143,17 +143,18 @@ class FileUtil(object):
 
     # 聚类，得到各簇SSE（sum of the squared errors)，作为手肘法评估确定ｋ的依据
     @staticmethod
-    def pilotClustering(cfg_sector, vectors, k_from=1):
+    def pilotClustering(classifier_section_name, vectors, k_from=1):
         pilot_list = []  # [(k_, inertia, criterion, top5_percent)] criteria取inertia变化率的一阶微分的极大值
-        FileUtil.__pilot(cfg_sector, k_from, vectors, pilot_list)
-        return FileUtil.__getTop(cfg_sector, pilot_list)
+        FileUtil.__pilot(classifier_section_name, k_from, vectors, pilot_list)
+        return FileUtil.__getTop(classifier_section_name, pilot_list)
 
     # 从k_from到k_to聚类,得到pilot_list
     @staticmethod
-    def __pilot(cfg_sector, k_from, vectors, pilot_list):
+    def __pilot(classifier_section_name, k_from, vectors, pilot_list):
+
         norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度标准化因子，保证不同向量的可比性
-        termination_inertia = G.cfg.getfloat(cfg_sector, 'NormalizedTerminationInertia') * norm_factor
-        k_to = G.cfg.getint(cfg_sector, 'MaxCategory')
+        termination_inertia = G.cfg.getfloat(classifier_section_name, 'NormalizedTerminationInertia') * norm_factor
+        k_to = G.cfg.getint(classifier_section_name, 'MaxCategory')
         for k_ in range(k_from, k_to):
             kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
             if k_ < k_from + 2:
@@ -182,9 +183,10 @@ class FileUtil(object):
 
     # 从pilot list中取极大值
     @staticmethod
-    def __getTop(cfg_sector, pilot_list):
+    def __getTop(classifier_section_name, pilot_list):
         pilot_array = np.array(pilot_list)[1:, :]  # 去掉第一个没法计算criterion值的
-        pilot_array = pilot_array[pilot_array[:, 3] < G.cfg.getfloat(cfg_sector, 'Top5Ratio')]  # 去掉top5占比超标的
+        pilot_array = pilot_array[
+            pilot_array[:, 3] < G.cfg.getfloat(classifier_section_name, 'Top5Ratio')]  # 去掉top5占比超标的
         pilot_array = pilot_array[argrelextrema(pilot_array[:, 2], np.greater)]  # 得到极大值
         criteria = pilot_array[:, 2].tolist()
         if not criteria:  # 没有极值
@@ -217,14 +219,14 @@ class FileUtil(object):
 
     # 重新聚类，得到各Cluster的中心点、分位点距离、边界距离以及数量占比等
     @staticmethod
-    def buildModel(k_, vectors):
+    def buildModel(classifier_section_name, k_, vectors):
         # 再次聚类并对结果分组。 Kmeans不支持余弦距离
         kmeans = KMeans(n_clusters=k_, n_init=20, max_iter=500).fit(vectors)
         norm_factor = - vectors.shape[1]  # 按字典宽度归一化
         groups = pd.DataFrame({'C': kmeans.labels_, 'S': [kmeans.score([v]) / norm_factor for v in vectors]}).groupby(
             'C')
         percents = groups.size() / len(vectors)  # 该簇向量数在聚类总向量数中的占比
-        cfg_q = G.cfg.getfloat('Classifier', 'Quantile')
+        cfg_q = G.cfg.getfloat(classifier_section_name, 'Quantile')
         quantiles = np.array([groups.get_group(i)['S'].quantile(cfg_q, interpolation='higher') for i in range(k_)])
         boundaries = groups['S'].agg('max').values  # 该簇中最远点距离
 
@@ -234,7 +236,7 @@ class FileUtil(object):
         quantiles = boundaries - quantiles
         quantiles[quantiles < 1e-100] = 1e-100  # 避免出现0/0
 
-        G.log.info('Model(k=%d) built. inertia=%e， max proportion=%.2f%%, max quantile=%e, max border=%e',
+        G.log.info('Model(k=%d) built. inertia=%e， max proportion=%.2f%%, max quantiles=%e, max border=%e',
                    k_, kmeans.inertia_, max(percents) * 100, max(quantiles), max(boundaries))
         return kmeans, percents, boundaries, quantiles
 
@@ -445,7 +447,7 @@ class DbUtil(object):
         db_type, db_addr, db_user, db_passwd = G.cfg.get('General', 'db').split(':')
         try:
             if db_type == 'mysql':
-                db = pymysql.connect(db_addr, db_user, db_passwd, 'ailog-backend', charset='utf8')
+                db = pymysql.connect(db_addr, db_user, db_passwd, 'ailog', charset='utf8')
                 return db
             else:
                 return None
