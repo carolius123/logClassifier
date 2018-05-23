@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# @File  : Classifier.py
+# @File  : FileClassifier.pyfierModel.py
 # @Author: Sui Huafeng
 # @Date  : 2018/4
 # @Desc  : 从$DATA/input中所有样本文件中训练一个日志文件分类器
@@ -21,9 +21,9 @@ from utilites import Dbc, FileUtil, DbUtil
 
 
 # 对数十、上百万个文件进行聚类，形成聚类模型
-class Classifier(object):
+class FileClassifier(object):
     """
-    新建对象或者调用reCluster方法，可以对$DATA/l0cache/重新聚类生成Classifier模型
+    新建对象或者调用reCluster方法，可以对$DATA/l0cache/重新聚类生成fc模型
     调用predictFile或PredictFiles方法，可以预测新的日志文件类型及其置信度
     $DATA/l0cache/: 存储各样本文件。目录结构就是被管服务器原始结构
     """
@@ -403,5 +403,5 @@ class Classifier(object):
 
 
 if __name__ == '__main__':
-    print(Classifier.__doc__)
+    print(FileClassifier.__name__, FileClassifier.__doc__)
     print('This program cannot run directly')

@@ -10,7 +10,7 @@ import shutil
 import threading
 import time
 
-from Classifier import Classifier
+from FileClassifier import FileClassifier
 from config import Workspaces as G
 from utilites import Dbc, FileUtil, DbUtil
 
@@ -25,7 +25,7 @@ class BatchJobService(object):
         self.models = []
         for model_file in [G.productFileClassifierModel, G.projectFileClassifierModel]:
             if os.path.exists(model_file):
-                model = Classifier(model_file=model_file)
+                model = FileClassifier(model_file=model_file)
             else:
                 model = None
             self.models.append(model)
@@ -120,10 +120,10 @@ class BatchJobService(object):
         """
         self.__clearModelAndConfig()
         FileUtil.mergeFilesByName(G.l0_inputs, G.l1_cache)
-        product_model = Classifier(model_file=G.productFileClassifierModel)
+        product_model = FileClassifier(model_file=G.productFileClassifierModel)
         if product_model.model:
             self.__reClassifyAllSamples(product_model)
-        project_model = Classifier()
+        project_model = FileClassifier()
         project_model.reCluster()
 
         self.models = [product_model, project_model]

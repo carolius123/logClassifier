@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# @File  : Categorizer.py
-# @Author: Sui Huafeng
+# @File  : RecordClassifier @Author: Sui Huafeng
 # @Date  : 2018/3
 # @Desc  : 从$DATA/l2cache中每一个样本文件中训练一个日志记录分类器
 
@@ -24,7 +23,7 @@ from utilites import FileUtil
 
 
 # 对一个数千到数十万行的文件中的记录进行聚类，形成聚类模型
-class Categorizer(object):
+class RecordClassifier(object):
     """
     新建对象或者调用trainModel方法，可以生成Categorizer模型
     调用predict方法，可以预测新记录的类型及其置信度
@@ -345,7 +344,7 @@ if __name__ == '__main__':
             filename = os.path.join(G.l2_cache, filename)
             if os.path.isfile(filename):
                 G.log.info('[%d]%s: Record classifying...', index, filename)
-                rc = Categorizer(filename)
+                rc = RecordClassifier(filename)
         except Exception as err:
             errors += 1
             G.log.error('%s ignored due to: %s', filename, str(err))

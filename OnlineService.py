@@ -11,7 +11,7 @@ import shutil
 import threading
 import time
 
-from Classifier import Classifier
+from FileClassifier import FileClassifier
 from anchor import Anchor
 from config import Workspaces as G
 from utilites import Dbc, FileUtil, DbUtil
@@ -29,7 +29,7 @@ class OnlineService(object):
         self.models = []
         for model_file in [G.productFileClassifierModel, G.projectFileClassifierModel]:
             if os.path.exists(model_file):
-                model = Classifier(model_file=model_file)
+                model = FileClassifier(model_file=model_file)
             else:
                 model = None
             self.models.append(model)
@@ -224,6 +224,7 @@ class OnlineService(object):
         return status
 
     def working(self, flow_id, flow_status, data_flow):
+        line = ''
         for line in data_flow:
             pass
         print('last Line:', line)
