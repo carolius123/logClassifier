@@ -145,13 +145,6 @@ class FileUtil(object):
     @staticmethod
     def pilotClustering(classifier_section_name, vectors, k_from=1):
         pilot_list = []  # [(k_, inertia, criterion, top5_percent)] criteria取inertia变化率的一阶微分的极大值
-        FileUtil.__pilot(classifier_section_name, k_from, vectors, pilot_list)
-        return FileUtil.__getTop(classifier_section_name, pilot_list)
-
-    # 从k_from到k_to聚类,得到pilot_list
-    @staticmethod
-    def __pilot(classifier_section_name, k_from, vectors, pilot_list):
-
         norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度标准化因子，保证不同向量的可比性
         termination_inertia = G.cfg.getfloat(classifier_section_name, 'NormalizedTerminationInertia') * norm_factor
         k_to = G.cfg.getint(classifier_section_name, 'MaxCategory')
@@ -179,14 +172,14 @@ class FileUtil(object):
             bad_percent = 0
             pilot_list.append([k_, inertia, None, top5_percent, bad_percent])
             if inertia < termination_inertia:  # 已经收敛到很小且找到可选值，没必要继续增加
+                if pilot_list[-2][1] > termination_inertia * 100:
+                    G.log.info('pilot-cluster finished. preferred k=%d[inertia from %e reduced to %e suddenly]', k_,
+                               pilot_list[-2][1], inertia)
+                    return k_
                 break
 
-    # 从pilot list中取极大值
-    @staticmethod
-    def __getTop(classifier_section_name, pilot_list):
-        pilot_array = np.array(pilot_list)[1:, :]  # 去掉第一个没法计算criterion值的
-        pilot_array = pilot_array[
-            pilot_array[:, 3] < G.cfg.getfloat(classifier_section_name, 'Top5Ratio')]  # 去掉top5占比超标的
+        pilot_array = np.array(pilot_list)[1:-1, :]  # 去掉第一个和最后一个没法计算criterion值的
+        pilot_array = pilot_array[pilot_array[:, 3] < G.cfg.getfloat(classifier_section_name, 'Top5Ratio')]
         pilot_array = pilot_array[argrelextrema(pilot_array[:, 2], np.greater)]  # 得到极大值
         criteria = pilot_array[:, 2].tolist()
         if not criteria:  # 没有极值
@@ -202,7 +195,7 @@ class FileUtil(object):
         products = [k * c for k, i, c, t, b in max_top_n]
         idx_ = products.index(max(products))
         preferred = max_top_n[idx_][0]
-        G.log.info('pilot-cluster finished. preferred k=(%d)', preferred)
+        G.log.info('pilot-cluster finished. preferred k=%d', preferred)
         return preferred
 
     @staticmethod
@@ -250,7 +243,7 @@ class FileUtil(object):
                     if not result:
                         continue
                     category, category_name, confidence, distance = result
-                    if confidence < G.minConfidence:  # 置信度不够,未完成分类
+                    if confidence < G.minFileConfidence:  # 置信度不够,未完成分类
                         continue
                     classified_files.append(
                         [model.model_id, common_name, category, category_name, confidence, distance])
@@ -282,7 +275,7 @@ class FileUtil(object):
     @staticmethod
     def mergeFilesByClass(cursor, to_):
         c = [0, 0, 0]  # counter
-        sql = 'SELECT model_id+category_id*10,category_name, file_fullname FROM files_classified WHERE confidence >= %f ORDER BY model_id, category_id, last_collect, last_update' % G.minConfidence
+        sql = 'SELECT model_id+category_id*10,category_name, file_fullname FROM files_classified WHERE confidence >= %f ORDER BY model_id, category_id, last_collect, last_update' % G.minFileConfidence
         cursor.execute(sql)
         results = cursor.fetchall()
         prev_id = -1
@@ -342,7 +335,7 @@ class FileUtil(object):
     @staticmethod
     def __querySamples(cursor, additional_where):
         sql = 'SELECT model_id,category_id, host, remote_path, filename, common_name,anchor_name, anchor_start_col, anchor_end_col,last_collect,last_update FROM files_classified WHERE confidence >= %f %s ORDER BY model_id, category_id, host, remote_path' % (
-            G.minConfidence, additional_where)
+            G.minFileConfidence, additional_where)
         cursor.execute(sql)
         return cursor.fetchall()
 
@@ -429,11 +422,11 @@ class FileUtil(object):
         return shortest[:i] + '*'
 
     @staticmethod
-    def splitResults(model_id, results):
+    def splitResults(model_id, min_confidence, results):
         classified_files, unclassified_files = [], []
         for common_name, category, category_name, confidence, distance in zip(results[0], results[1], results[2],
                                                                               results[3], results[4]):
-            if confidence < G.minConfidence:  # 置信度不够,未完成分类
+            if confidence < min_confidence:  # 置信度不够,未完成分类
                 unclassified_files.append(common_name)
             else:
                 classified_files.append([model_id, common_name, category, category_name, confidence, distance])

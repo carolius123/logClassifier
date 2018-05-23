@@ -25,8 +25,10 @@ class FileClassifier(object):
     以文件名为参数创建对象或者调用loadModel方法，可装载fc模型
     调用predictFile或predictFiles方法, 可以预测新的日志文件类型及其置信度
     """
+    __ClassName = 'FileClassifier'
     __corpusCacheFile = os.path.join(G.projectModelPath, 'corpuscache.1')
     l1_dbf = os.path.join(G.projectModelPath, 'metadata.1')
+    maxClassifyLines = G.cfg.getint(__ClassName, 'MaxLines')
 
     def __init__(self, model_file_or_samples_path):
         self.ruleSet = None  # 处理文件正则表达式
@@ -98,7 +100,7 @@ class FileClassifier(object):
         # 尝试不同的向量化规则，确定聚类数量K_
         for self.ruleSet in FileUtil.loadRuleSets():
             corpus_cache_fp = self.__buildDictionary(from_path)  # 建立字典self.dictionary，返回语料缓存文件
-            if len(self.dictionary) < G.cfg.getint('Classifier', 'LeastTokens'):  # 字典字数太少,重新采样
+            if len(self.dictionary) < G.cfg.getint(self.__ClassName, 'LeastTokens'):  # 字典字数太少,重新采样
                 corpus_cache_fp.close()
                 self.__clearCache()
                 G.log.info('Too few tokens[%d], Re-sample with next RuleSet.', len(self.dictionary))
@@ -107,14 +109,14 @@ class FileClassifier(object):
             vectors = self.__buildVectors(corpus_cache_fp, self.dictionary.num_docs)  # 建立稀疏矩阵doc*(dct + stats)
             corpus_cache_fp.close()  # 关闭缓存文件
             start_k = min(50, int(vectors.shape[0] / 100))
-            k_ = k_ if k_ else FileUtil.pilotClustering('Classifier', vectors, start_k)  # 多个K值试聚类，返回最佳K
+            k_ = k_ if k_ else FileUtil.pilotClustering(self.__ClassName, vectors, start_k)  # 多个K值试聚类，返回最佳K
             if k_ != 0:  # 找到合适的K，跳出循环
                 break
             self.__clearCache()  # 清除缓存的corpus_cache_file
         else:
             raise UserWarning('Cannot generate qualified corpus by all RuleSets')
         # 重新聚类, 得到模型(向量数、中心点和距离）和分类(向量-所属类)
-        self.models, percents, boundaries, quantiles = FileUtil.buildModel('Classifier', k_, vectors)
+        self.models, percents, boundaries, quantiles = FileUtil.buildModel(self.__ClassName, k_, vectors)
         names = ['fc%d' % i for i in range(len(percents))]
         self.categories = [names, percents, boundaries, quantiles]
         results = self.__getResult(vectors)
@@ -122,7 +124,9 @@ class FileClassifier(object):
         self.__saveModel()  # models saved to file
         with Dbc() as cursor:
             file_and_results = [self.common_filenames] + list(results)
-            classified_common_files, unclassified_common_files = FileUtil.splitResults(self.model_id, file_and_results)
+            classified_common_files, unclassified_common_files = FileUtil.splitResults(self.model_id,
+                                                                                       G.minFileConfidence,
+                                                                                       file_and_results)
             DbUtil.dbUdFilesMerged(cursor, classified_common_files, unclassified_common_files)
             FileUtil.mergeFilesByClass(cursor, G.l2_cache)  # 同类文件合并到to_目录下
             wildcard_log_files = FileUtil.genGatherList(cursor)  # 生成采集文件列表
@@ -149,15 +153,16 @@ class FileClassifier(object):
             self.dictionary.add_documents([document])
             cache_fp.write(' '.join([word for word in document]) + '\n')
 
-        if self.dictionary.num_docs < G.cfg.getint('Classifier', 'LeastFiles'):  # 字典字数太少或文档数太少，没必要聚类
+        if self.dictionary.num_docs < G.cfg.getint(self.__ClassName, 'LeastFiles'):  # 字典字数太少或文档数太少，没必要聚类
             cache_fp.close()
             self.__clearCache()
             raise UserWarning('Too few documents[%d] to clustering' % self.dictionary.num_docs)
 
         # 去掉低频词，压缩字典
         num_token = len(self.dictionary)
-        no_below = int(min(G.cfg.getfloat('Classifier', 'NoBelow'), int(self.dictionary.num_docs / 50)))
-        self.dictionary.filter_extremes(no_below=no_below, no_above=0.999, keep_n=G.cfg.getint('Classifier', 'KeepN'))
+        no_below = int(min(G.cfg.getfloat(self.__ClassName, 'NoBelow'), int(self.dictionary.num_docs / 50)))
+        self.dictionary.filter_extremes(no_below=no_below, no_above=0.999,
+                                        keep_n=G.cfg.getint(self.__ClassName, 'KeepN'))
         self.dictionary.compactify()
         G.log.info('Dictionary built with [%s](%d tokens, reduced from %d), from %d files( %d words)',
                    self.ruleSet[0], len(self.dictionary), num_token, self.dictionary.num_docs, self.dictionary.num_pos)
@@ -224,7 +229,7 @@ class FileClassifier(object):
             document += words  # 生成词表
             lc.append(len(line))
             lw.append(len(words))
-            if line_idx > G.maxClassifyLines:
+            if line_idx > self.maxClassifyLines:
                 break
         line_idx += 1
 

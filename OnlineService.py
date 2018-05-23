@@ -36,7 +36,8 @@ class OnlineService(object):
         threading.Thread(target=self.deamon).start()
 
     # Deamon for new flow
-    def deamon(self):
+    @staticmethod
+    def deamon():
         G.log.info('OnlineService::deamon started, ready for accept new log flow.')
         while True:
             time.sleep(60)
@@ -156,7 +157,7 @@ class OnlineService(object):
                 fp.write(line)
                 received_lines += 1
                 received_bytes += len(line)
-                if flow_status == '未锚定' and received_lines >= G.maxClassifyLines:
+                if flow_status == '未锚定' and received_lines >= FileClassifier.maxClassifyLines:
                     DbUtil.dbUpdFlow(cursor, flow_id, ['received_lines', 'received_bytes'],
                                      [received_lines, received_bytes])
                     return 'OK', file_fullname
@@ -223,7 +224,8 @@ class OnlineService(object):
 
         return status
 
-    def working(self, flow_id, flow_status, data_flow):
+    @staticmethod
+    def working(flow_id, flow_status, data_flow):
         line = ''
         for line in data_flow:
             pass

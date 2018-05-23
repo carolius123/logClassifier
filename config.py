@@ -43,7 +43,7 @@ class Workspaces(object):
 
     timeMargin = cfg.getint('General', 'TimeMargin')
     dateMargin = cfg.getint('General', 'DateMargin')
-    last_update_seconds = cfg.getint('Classifier', 'LastUpdateHours') * 3600
+    last_update_seconds = cfg.getint('General', 'LastUpdateHours') * 3600
     '''
     fileDescriptor文件保存如下列表: [[l0_filenames], [fd_origin], [fd_common], [fd_category]]. 其中,
         l0_filenames 是$l0_input中所有文件全路径名列表, 目录分割符为/
@@ -58,15 +58,14 @@ class Workspaces(object):
 
     productFileClassifierModel = os.path.join(productModelPath, 'FileClassifier.Model')
     projectFileClassifierModel = os.path.join(projectModelPath, 'FileClassifier.Model')
-    fileMergePattern = re.compile(cfg.get('Classifier', 'FileMergePattern'))
-    fileCheckPattern = re.compile(cfg.get('Classifier', 'FileCheckPattern'))
-    minConfidence = cfg.getfloat('Classifier', 'MinConfidence')
-    maxClassifyLines = cfg.getint('Classifier', 'MaxLines')
+    fileMergePattern = re.compile(cfg.get('General', 'FileMergePattern'))
+    fileCheckPattern = re.compile(cfg.get('General', 'FileCheckPattern'))
+    minFileConfidence = cfg.getfloat('FileClassifier', 'MinConfidence')
 
     win = (system() == 'Windows')  # 本机操作系统类型，用于处理路径分隔符等Win/Unix的差异
 
     # 初始化日志设置
-    log = logging.getLogger() if cfg.getboolean('General', 'IncludeLibs') else logging.getLogger('classifier')
+    log = logging.getLogger() if cfg.getboolean('General', 'IncludeLibs') else logging.getLogger('ailog')
     logLevel = cfg.getint('General', 'LogLevel')
     log.setLevel(logLevel)
     __formatter = logging.Formatter('%(asctime)s\t%(levelname)s\t%(filename)s %(lineno)d\t%(message)s')

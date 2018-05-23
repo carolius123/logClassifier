@@ -110,36 +110,21 @@ class BatchJobService(object):
         os.remove(description_file)
 
     # 重新初始化模型
-    def reInitialization(self):
+    def reInitialization(self, re_merge=False):
         """
         系统积累了一定量的无法通过产品内置模型分类的样本, 或者产品模型升级后, 重新聚类形成现场模型.
         清理以前的现场数据 -> 重新合并原始样本->采用内置产品模型分类 -> 日志文件模型聚类 -> 日志记录模型聚类 -> 重新计算基线
         :return:
         """
         self.__clearModelAndConfig()
-        FileUtil.mergeFilesByName(G.l0_inputs, G.l1_cache)
+        if re_merge:
+            FileUtil.mergeFilesByName(G.l0_inputs, G.l1_cache)
         product_model = FileClassifier(G.productFileClassifierModel)
         if product_model.models:
             self.__reClassifyAllSamples(product_model)
         project_model = FileClassifier(G.l1_cache)
         self.models = [product_model, project_model]
         self.__buildRcModels(G.l2_cache)
-
-    @staticmethod
-    def __buildRcModels(from_path):
-        errors = 0
-        filename, index = '', 0
-        for index, filename in enumerate(os.listdir(from_path)):
-            try:
-                filename = os.path.join(from_path, filename)
-                if os.path.isfile(filename):
-                    G.log.info('[%d]%s: Record classifying...', index, filename)
-                    RecordClassifier(samples_file=filename)
-            except Exception as err:
-                errors += 1
-                G.log.error('%s ignored due to: %s', filename, str(err))
-                continue
-        G.log.info('%d models built and stored in %s, %d failed.', G.projectModelPath, index + 1 - errors, errors)
 
     @staticmethod
     def __clearModelAndConfig():
@@ -161,12 +146,29 @@ class BatchJobService(object):
     def __reClassifyAllSamples(model):
         G.log.info('Classifying files in %s by models %s', G.l1_cache, G.productFileClassifierModel)
         results = model.predictFiles(G.l1_cache)
-        classified_common_files, unclassified_common_files = FileUtil.splitResults(model.model_id, results)
+        classified_common_files, unclassified_common_files = FileUtil.splitResults(model.model_id, G.minFileConfidence,
+                                                                                   results)
         with Dbc() as cursor:
             DbUtil.dbUdFilesMerged(cursor, classified_common_files, unclassified_common_files)
+
+    @staticmethod
+    def __buildRcModels(from_path):
+        errors = 0
+        filename, index = '', 0
+        for index, filename in enumerate(os.listdir(from_path)):
+            try:
+                filename = os.path.join(from_path, filename)
+                if os.path.isfile(filename):
+                    G.log.info('[%d]%s: Record classifying...', index, filename)
+                    RecordClassifier(samples_file=filename)
+            except Exception as err:
+                errors += 1
+                G.log.error('%s ignored due to: %s', filename, str(err))
+                continue
+        G.log.info('%d models built and stored in %s, %d failed.', G.projectModelPath, index + 1 - errors, errors)
 
 
 if __name__ == '__main__':
     bcs = BatchJobService()
-    bcs.reInitialization()
-    bcs.run()
+    bcs.reInitialization(re_merge=True)
+    # bcs.run()

@@ -6,9 +6,7 @@
 
 
 import os
-from collections import Counter
 from tempfile import TemporaryFile
-from time import localtime, strftime
 
 import numpy as np
 from gensim.corpora import Dictionary
@@ -42,14 +40,15 @@ class RecordClassifier(object):
     3.2 对于记录数特别多的类别(太粗),可根据枚举型、IP、URL、错误码等进一步细化分类
     3.4 数字变量中可能包含时长、数量等指标数据，可考虑提取和利用的手段
     """
-    __LeastDocuments = G.cfg.getint('RecordCluster', 'LeastRecords')  # 样本数小于该值，没有必要聚类
-    __LeastTokens = G.cfg.getint('RecordCluster', 'LeastTokens')  # 字典最少词数，低于此数没必要聚类
-    __KeepN = G.cfg.getint('RecordCluster', 'KeepN')  # 字典中最多词数，降低计算量
-    __NoBelow = G.cfg.getfloat('RecordCluster', 'NoBelow')  # 某词出现在文档数低于该比例时，从字典去掉，以排除干扰，降低计算量
+    __ClassName = 'RecordClassifier'
+    __LeastDocuments = G.cfg.getint(__ClassName, 'LeastRecords')  # 样本数小于该值，没有必要聚类
+    __LeastTokens = G.cfg.getint(__ClassName, 'LeastTokens')  # 字典最少词数，低于此数没必要聚类
+    __KeepN = G.cfg.getint(__ClassName, 'KeepN')  # 字典中最多词数，降低计算量
+    __NoBelow = G.cfg.getfloat(__ClassName, 'NoBelow')  # 某词出现在文档数低于该比例时，从字典去掉，以排除干扰，降低计算量
 
-    __Top5Ratio = G.cfg.getfloat('RecordCluster', 'Top5Ratio')  # Top5类中样本数占总样本比例。大于该值时聚类结果不可接受
-    __MaxCategory = G.cfg.getint('RecordCluster', 'MaxCategory')  # 尝试聚类的最大类别，以降低计算量
-    __Quantile = G.cfg.getfloat('RecordCluster', 'Quantile')  # 类别的边界，该类中以该值为分位数的点，作为该类的边界
+    __Top5Ratio = G.cfg.getfloat(__ClassName, 'Top5Ratio')  # Top5类中样本数占总样本比例。大于该值时聚类结果不可接受
+    __MaxCategory = G.cfg.getint(__ClassName, 'MaxCategory')  # 尝试聚类的最大类别，以降低计算量
+    __Quantile = G.cfg.getfloat(__ClassName, 'Quantile')  # 类别的边界，该类中以该值为分位数的点，作为该类的边界
 
     def __init__(self, model_file='', samples_file='', anchor=None):
         self.ruleSet = None  # 处理文件正则表达式
@@ -60,6 +59,8 @@ class RecordClassifier(object):
         self.boundaries = None  # 最远点到(0.8)分位点距离平方
         self.quantiles = None  # (0.8)分位点到中心点距离平方
         self.anchor = anchor  # 时间戳锚点Anchor
+
+        self.tmp_cache_file = None
 
         if os.path.exists(model_file):  # 从模型文件装载模型
             self.anchor, self.ruleSe, self.dictionary, self.models, self.alias, self.percent, self.boundaries, self.quantiles = joblib.load(
@@ -77,27 +78,29 @@ class RecordClassifier(object):
             if not self.dictionary:  # 字典太短，换rule set重新采样
                 continue
             start_k = int(min(len(self.dictionary) / 10, vectors.shape[0] / 100))
-            k_ = FileUtil.pilotClustering('RecordCluster', vectors, start_k)  # 多个K值试聚类，返回最佳K
+            k_ = self.pilotClustering(self.__ClassName, vectors, start_k)  # 多个K值试聚类，返回最佳K
             if k_:  # 找到合适的K，跳出循环, 否则换rule set重新采样
                 break
         else:
             raise UserWarning('Cannot generate qualified corpus by all RuleSets')
 
-        self.models, self.percent, self.boundaries, self.quantiles = FileUtil.buildModel('RecordCluster', k_, vectors)
+        self.models, self.percent, self.boundaries, self.quantiles = FileUtil.buildModel(self.__ClassName, k_, vectors)
+        self.alias = ['rc' + str(i) for i in range(len(self.quantiles))]  # 簇的别名，默认为rci，可人工命名
+
         self.__saveModel(samples_file)
-        G.log.info('Model saved to %s successful.' % os.path.join(G.projectModelPath, samples_file + '.mdl'))
+        self.__saveResult(samples_file, vectors)
 
     # 文档向量化。dataset-[document:M]-[[word]]-[[token]]-[BoW:M]-corpus-tfidf-dictionary:N, [vector:M*N]
     def __buildVectors(self, samples_file):
         lines = 0
         dct = Dictionary()
-        tmp_file = TemporaryFile(mode='w+t', encoding='utf-8')
+        self.tmp_cache_file = TemporaryFile(mode='w+t', encoding='utf-8')
         for doc_idx, (document, lines) in enumerate(self.__buildDocument(samples_file)):
             dct.add_documents([document])
-            tmp_file.write(' '.join(document) + '\n')
+            self.tmp_cache_file.write(' '.join(document) + '\n')
             if doc_idx % 500 == 0: G.log.debug('Processed %d records in %s', doc_idx, samples_file)
         if dct.num_docs < self.__LeastDocuments:  # 字典字数太少或文档数太少，没必要聚类
-            tmp_file.close()
+            self.tmp_cache_file.close()
             raise UserWarning('Too few records[%d]' % dct.num_docs)
 
         # 去掉低频词，压缩字典
@@ -109,19 +112,18 @@ class RecordClassifier(object):
                    len(dct), num_token, self.ruleSet[0], dct.num_docs, lines, dct.num_pos, samples_file)
         if len(dct) < self.__LeastTokens:  # 字典字数太少,重新采样
             G.log.info('Too few tokens[%d], Re-sample with next RuleSet].' % (len(dct)))
-            tmp_file.close()
+            self.tmp_cache_file.close()
             return None, None
 
         # 构造tf-idf词袋和文档向量
         tfidf_model = TfidfModel(dictionary=dct, normalize=False)
         vectors = np.zeros((dct.num_docs, len(dct)))
-        tmp_file.seek(0)
-        for doc_idx, new_line in enumerate(tmp_file):
+        self.tmp_cache_file.seek(0)
+        for doc_idx, new_line in enumerate(self.tmp_cache_file):
             for (word_idx, tf_idf_value) in tfidf_model[dct.doc2bow(new_line.split())]:  # [(id,tf-idf)...], id是升序
                 vectors[doc_idx, word_idx] = tf_idf_value
         G.log.info('[%d*%d]Vectors built, %.2f%% non-zeros.' % (
             dct.num_docs, len(dct), dct.num_nnz * 100 / len(dct) / dct.num_docs))
-        tmp_file.close()
         return dct, vectors
 
     # 预处理文件，迭代方式返回某条记录的词表.
@@ -152,100 +154,62 @@ class RecordClassifier(object):
                 G.log.exception('Record [%s] ignored due to the following error:', record)
         raise StopIteration()
 
-
     # 聚类，得到各簇SSE（sum of the squared errors)，作为手肘法评估确定ｋ的依据
-    def __pilotClustering( self, vectors, k_from=1 ):
-        cell_norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度归一化
+    @staticmethod
+    def pilotClustering(classifier_section_name, vectors, from_=1):
+        norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度标准化因子，保证不同向量的可比性
+        termination_inertia = G.cfg.getfloat(classifier_section_name, 'NormalizedTerminationInertia') * norm_factor
 
-        k_, sse_set = 0, []
-        for k_ in range(k_from, k_from + 3):
-            kmeans = KMeans(n_clusters=k_).fit(vectors)  # 试聚类
-            sse = kmeans.inertia_ / cell_norm_factor
-            G.log.debug('pilot clustering. k=%d, normSSE= %f', k_, sse)
-            sse_set.append(sse)
-        last_indicator = (sse_set[0] + sse_set[2]) / sse_set[1]  # 二阶微分的相对值
-        last_k = k_from + 2
+        k_ = G.cfg.getint(classifier_section_name, 'MaxCategory')
 
-        maxima = None  # (k, kmeans, sse, indicator)
-        prefer = (0, None, 0, 0, 0)  # (K_, kmeans, sse, indicator, ratio of top5 labels)
-        last_top5_value, last_top5_idx = 100, 1
-        for k_ in range(k_from + 3, self.__MaxCategory):
-            kmeans = KMeans(n_clusters=k_).fit(vectors)  # 试聚类
-            sse = kmeans.inertia_ / cell_norm_factor
-            G.log.debug('pilot clustering. k=%d, normSSE= %f', k_, sse)
-            if sse >= sse_set[-1]:  # SSE变大，是误差，应滤除之
-                continue
+        kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
+        G.log.info('pilot clustering. (k,inertia)=\t%d\t%e', k_, kmeans.inertia_)
+        if kmeans.inertia_ > termination_inertia:
+            return k_
 
-            sse_step = (sse - sse_set[-1]) / (k_ - last_k)  # 用SSE_step代替SSE，可兼容有误差情况
-            sse_set.pop(0)
-            sse_set.append(sse_set[-1] + sse_step)
-            indicator = (sse_set[-3] + sse_set[-1]) / sse_set[-2]
+        # while k_ < len(vectors):
+        #     kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
+        #     G.log.info('pilot clustering. (k,inertia)=\t%d\t%e', k_, kmeans.inertia_)
+        #     if kmeans.inertia_ < termination_inertia:
+        #         break
+        #     k_ *= 2
 
-            if indicator > last_indicator:  # 开始增大
-                maxima = [k_, kmeans, sse, indicator]
-            elif maxima is not None and indicator < last_indicator:  # 增大后开始减小，prev是极大值点
-                n = min(5, int(k_ * 0.1) + 1)
-                top5_ratio = sum([v for (k, v) in Counter(maxima[1].labels_).most_common(n)]) / vectors.shape[0]
-                if prefer[3] < maxima[3] and top5_ratio < self.__Top5Ratio:  # Top5Label中样本比例有效（没有失衡)
-                    prefer = maxima + [top5_ratio]
-                G.log.info('Maxima point. k=(%d,%.2f) normSSE=%.2f, Top%d labels=%.1f%%. Preferred (%d,%.2f)',
-                           maxima[0], maxima[3], maxima[2], n, top5_ratio * 100, prefer[0], prefer[3])
-                maxima = None  # 变量复位，准备下一个极大值点
-                if top5_ratio < last_top5_value - 0.001:
-                    last_top5_value = top5_ratio
-                    last_top5_idx = k_
-                else:
-                    if k_ - last_top5_idx > 50:  # 连续50个K_比例不降
-                        break
-
-            if sse < 1:  # 已经收敛到很小且找到可选值，没必要继续增加
-                break
-
-            sse_set[-1] = sse  # 如无异常误差点，这些操作只是重复赋值，无影响。如有，更新当前点值，准备下一循环
-            sse_set[-2] = sse_set[-1] - sse_step
-            last_indicator = indicator
-            last_k = k_
-
-        G.log.info('pilot-clustering[k:1-%d] finished. preferred k=(%d, %.2f),normSSE=%.2f, TopN labels=%.1f%%'
-                   % (k_, prefer[0], prefer[3], prefer[2], prefer[4] * 100))
-        return prefer[0]
-    # 重新聚类，得到各Cluster的中心点、分位点距离、边界距离以及数量占比等
-    def __buildClusterModel( self, k_, vectors ):
-        # 再次聚类并对结果分组。 Kmeans不支持余弦距离
-        kmeans = KMeans(n_clusters=k_, n_init=20, max_iter=500).fit(vectors)
-        norm_factor = - vectors.shape[1]  # 按字典宽度归一化，保证不同模型的可比性
-        groups = DataFrame({'C': kmeans.labels_, 'S': [kmeans.score([v]) / norm_factor for v in vectors]}).groupby('C')
-        alias = ['Type' + str(i) for i in range(k_)]  # 簇的别名，默认为rci，可人工命名
-        proportions = groups.size() / len(vectors)  # 该簇向量数在聚类总向量数中的占比
-        quantiles = np.array([groups.get_group(i)['S'].quantile(self.__Quantile, interpolation='higher')
-                              for i in range(k_)])
-        boundaries = groups['S'].agg('max').values - quantiles  # 该簇中最远点到分位点的距离
-        for i in range(k_):
-            if boundaries[i] > quantiles[i]:  # 边界太远的话，修正一下
-                boundaries[i] = quantiles[i]
-            elif boundaries[i] == 0:  # 避免出现0/0
-                boundaries[i] = 1e-100
-
-        G.log.info('Model(k=%d) built. inertia=%.3f， max proportion=%.2f%%, max quantiles=%.3f, max border=%.3f',
-                   k_, kmeans.inertia_, max(proportions) * 100, max(quantiles), max(boundaries))
-        return kmeans, alias, proportions, boundaries, quantiles
+        to_ = k_
+        while to_ - from_ > 1:
+            k_ = int(sum([from_, to_]) / 2)
+            kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
+            G.log.info('pilot clustering. (k,inertia)=\t%d\t%e', k_, kmeans.inertia_)
+            if kmeans.inertia_ < termination_inertia:
+                to_ = k_
+            else:
+                from_ = k_
+        G.log.info('pilot-cluster finished. preferred k=%d', to_)
+        return to_
 
     # 保存模型和结果
     def __saveModel(self, samples_file_fullname):
         samples_file = os.path.splitext(os.path.split(samples_file_fullname)[1])[0]
-        self.alias = ['rc' + str(i) for i in range(len(self.quantiles))]  # 簇的别名，默认为rci，可人工命名
         joblib.dump((self.anchor, self.ruleSet, self.dictionary, self.models, self.alias, self.percent,
                      self.boundaries, self.quantiles),
                     os.path.join(G.projectModelPath, samples_file + '.mdl'))  # 保存模型，供后续使用
         self.dictionary.save_as_text(os.path.join(G.logsPath, samples_file + '.dic.csv'))  # 保存文本字典，供人工审查
         df = DataFrame({'类型': self.alias, '样本占比': self.percent, '分位点距离': self.quantiles, '边界-分位点距离': self.boundaries})
-        df.to_csv(os.path.join(G.logsPath, samples_file + '.mdl.csv'), sep='\t', encoding='GBK')  # 保存聚类模型，供人工审查
+        df.to_csv(os.path.join(G.logsPath, samples_file + '.mdl.csv'), sep='\t', encoding='utf-8')  # 保存聚类模型，供人工审查
+        G.log.info('Model saved to %s successful.', os.path.join(G.projectModelPath, samples_file + '.mdl'))
 
-        df = DataFrame(columns=('时间', '记录分类', '置信度', '记录内容', '记录词汇'))
-        for idx, (timestamp, _, c_name, confidence, _, record, words) in enumerate(self.predict(samples_file_fullname)):
-            date_time = strftime('%Y-%m-%d %H:%M:%S', localtime(timestamp))
-            df.loc[idx] = date_time, c_name, confidence, record, words
-        df.to_csv(os.path.join(G.logsPath, samples_file + '.out.csv'), sep='\t', encoding='GBK')
+    def __saveResult(self, samples_file_fullname, vectors):
+        c_ids, c_names, confidences, distances = FileUtil.getPredictResult(self.models, self.alias, self.boundaries,
+                                                                           self.quantiles, vectors)
+        self.tmp_cache_file.seek(0)
+        records = [line for line in self.tmp_cache_file]
+        df = DataFrame({'Category': c_names, 'Confidence': confidences, 'Record': records})
+        # df = DataFrame(columns=('Category', 'Confidence', 'Record'))
+        # for idx, (c_name, confidence, record) in enumerate(zip(c_names, confidences, self.tmp_cache_file)):
+        #     df.loc[idx] = c_name, confidence, record
+        samples_file = os.path.splitext(os.path.split(samples_file_fullname)[1])[0]
+        df.to_csv(os.path.join(G.logsPath, samples_file + '.out.csv'), sep='\t', encoding='utf-8')
+        self.tmp_cache_file.close()
+        G.log.info('Result saved to %s successful.', os.path.join(G.logsPath, samples_file + '.out.csv'))
 
     # predict from txt file or txt data flow
     def predict(self, data_stream):
