@@ -32,20 +32,17 @@ class BatchJobService(object):
             self.models.append(model)
 
         self.interval = G.cfg.getfloat('BatchJobService', 'IntervalMinutes') * 60
-        self.db, self.cursor = None, None
 
     def run(self):
-        self.db = DbUtil.dbConnect()
-        if not self.db:  # Can't connect ro db, schedule to next
-            G.log.warning('Batch Service error, scheduled to next time')
-            threading.Timer(self.interval, self.run).start()
-        self.cursor = self.db.cursor()
-        self.classifyNewLogs()
-        self.db.commit()
-        self.db.close()
+        try:
+            with Dbc() as cursor:
+                self.classifyNewLogs(cursor)
+        except Exception as err:
+            G.log.warning('Batch Service error, scheduled to next time.%s', str(err))
+
         threading.Timer(self.interval, self.run).start()
 
-    def classifyNewLogs(self):
+    def classifyNewLogs(self, cursor):
         G.log.info('Extracting files from %s to %s', G.inbox, G.l0_inputs)
         for tar_file in os.listdir(G.inbox):
             if not tar_file.endswith('.tar.gz'):
@@ -55,37 +52,37 @@ class BatchJobService(object):
             tar_file_fullname = os.path.join(G.inbox, tar_file)
             try:
                 FileUtil.extractFile(tar_file_fullname, extract_to)  # 解压文件到当前目录
-                self.__dbUpdFilesSampledFromDescriptionFile(host, extract_to)  # 更新数据库中样本文件表
+                self.__dbUpdFilesSampledFromDescriptionFile(cursor, host, extract_to)  # 更新数据库中样本文件表
                 os.remove(tar_file_fullname)
                 common_files, file2merged = FileUtil.mergeFilesByName(extract_to, merge_to)
-                common_files = self.__getNewFiles(common_files)  # 滤除以前做过分类预测的文件
+                common_files = self.__getNewFiles(cursor, common_files)  # 滤除以前做过分类预测的文件
                 classified_files, unclassified_files = FileUtil.predictFiles(self.models, common_files)  # 进行分类预测
-                DbUtil.dbUdFilesMerged(self.cursor, classified_files, unclassified_files)  # 更新数据库中合并文件表
+                DbUtil.dbUdFilesMerged(cursor, classified_files, unclassified_files)  # 更新数据库中合并文件表
                 where_clause = ['"%s"' % common_name.replace('\\', '/') for _, common_name, _, _, _, _ in
                                 classified_files]
                 where_clause = ' AND common_name in (%s)' % ','.join(where_clause)
-                wildcard_log_files = FileUtil.genGatherList(self.cursor, where_clause)  # 生成采集文件列表
-                DbUtil.dbWildcardLogFiles(self.cursor, wildcard_log_files)  # 更新数据库中采集文件列表
-                self.db.commit()
+                wildcard_log_files = FileUtil.genGatherList(cursor, where_clause)  # 生成采集文件列表
+                DbUtil.dbInsertOrUpdateLogFlow(cursor, wildcard_log_files)  # 更新数据库中采集文件列表
                 G.log.info('%s extracted and classified successful.', tar_file)
             except Exception as err:
                 G.log.warning('%s extracted or classified error:%s', tar_file, str(err))
-                self.db.rollback()
                 continue
 
     # 滤除已成功分类的文件,返回新发现的日志文件
-    def __getNewFiles(self, common_files):
+    @staticmethod
+    def __getNewFiles(cursor, common_files):
         new_common_files = []
         for common_file in common_files:
             c_ = '"%s"' % common_file.replace('\\', '/')
             sql = 'SELECT COUNT(common_name) FROM files_merged WHERE  common_name=%s' % c_
-            self.cursor.execute(sql)
-            result = self.cursor.fetchone()
+            cursor.execute(sql)
+            result = cursor.fetchone()
             if not result[0]:
                 new_common_files.append(common_file)
         return new_common_files
 
-    def __dbUpdFilesSampledFromDescriptionFile(self, host, extract_to):
+    @staticmethod
+    def __dbUpdFilesSampledFromDescriptionFile(cursor, host, extract_to):
         host = '"%s"' % host
         description_file = os.path.join(extract_to, 'descriptor.csv')
         for line in open(description_file, encoding='utf-8'):
@@ -106,7 +103,7 @@ class BatchJobService(object):
             sql = 'INSERT INTO files_sampled (file_fullname,host,archive_path,filename,remote_path,last_update,last_collect,size) VALUES(%s,%s,%s,%s,%s,%s,%s,%d) ON DUPLICATE KEY UPDATE last_update=%s, last_collect=%s, size=%d' % (
                 file_fullname, host, archive_path, filename, remote_path, last_update_time, gather_time, ori_size,
                 last_update_time, gather_time, ori_size)
-            self.cursor.execute(sql)
+            cursor.execute(sql)
         os.remove(description_file)
 
     # 重新初始化模型
@@ -131,12 +128,8 @@ class BatchJobService(object):
         for folder in [G.projectModelPath, G.l2_cache, G.outputs]:
             if os.path.exists(folder):
                 shutil.rmtree(folder)
-        db = DbUtil.dbConnect()
-        if db:
-            cursor = db.cursor()
+        with Dbc() as cursor:
             cursor.execute('DELETE FROM file_class')
-            db.commit()
-            db.close()
 
         time.sleep(3)
         for folder in [G.projectModelPath, G.l2_cache, G.outputs]:
@@ -144,7 +137,7 @@ class BatchJobService(object):
 
     @staticmethod
     def __reClassifyAllSamples(model):
-        G.log.info('Classifying files in %s by models %s', G.l1_cache, G.productFileClassifierModel)
+        G.log.info('Classifying files in %s by model %s', G.l1_cache, G.productFileClassifierModel)
         results = model.predictFiles(G.l1_cache)
         classified_common_files, unclassified_common_files = FileUtil.splitResults(model.model_id, G.minFileConfidence,
                                                                                    results)
@@ -160,12 +153,12 @@ class BatchJobService(object):
                 filename = os.path.join(from_path, filename)
                 if os.path.isfile(filename):
                     G.log.info('[%d]%s: Record classifying...', index, filename)
-                    RecordClassifier(samples_file=filename)
+                    RecordClassifier([filename])
             except Exception as err:
                 errors += 1
                 G.log.error('%s ignored due to: %s', filename, str(err))
                 continue
-        G.log.info('%d models built and stored in %s, %d failed.', G.projectModelPath, index + 1 - errors, errors)
+        G.log.info('%d model built and stored in %s, %d failed.', G.projectModelPath, index + 1 - errors, errors)
 
 
 if __name__ == '__main__':

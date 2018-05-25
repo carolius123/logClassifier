@@ -32,7 +32,7 @@ class Anchor(object):
                               r'|(Oct)|(Nov)|(Dec)(?=\W)', re.I)
     __DateSep = r'[\\/-]'
     __HyphenDateIdx = {'YYMMDD': (0, 2, 3), 'MMDD': (0, 1, None)}
-    __HyphenDateSpecs = {'YYMMDD': r'(?<!\d)(\d{1,4})(?P<sep>' + __DateSep + ')(\d{1,4})(?P=sep)(\d){1,4}(?!\d)',
+    __HyphenDateSpecs = {'YYMMDD': r'(?<!\d)(\d{1,4})(?P<sep>' + __DateSep + ')(\d{1,4})(?P=sep)(\d{1,4})(?!\d)',
                          'MMDD': r'(?<!\d)([1-9]|[0-3]\d)' + __DateSep + '([1-9]|[0-3]\d)(?!\d)'
                          }
     __HyphenDateRegex = re.compile('|'.join('(?P<%s>%s)' % (k_, v_) for k_, v_ in __HyphenDateSpecs.items()), re.I)
@@ -159,7 +159,7 @@ class Anchor(object):
                 counter += 1
                 time_span = time_.span()
                 self.__probeHyphenDate(time_span, line, results, left)
-                if len(results) >= 2 or (counter > 5 and not results):  # 找够2个日期, 5个时间仍没有日期就退出
+                if len(results) >= 3 or (counter > 5 and not results):  # 找够2个日期, 5个时间仍没有日期就退出
                     break
             self.__setDatePattern(results, left)
         except Exception as err:
@@ -194,7 +194,17 @@ class Anchor(object):
             self.datePattern['name'] = None
             return
 
-        date_pattern = self.__probeDateOrder(results)
+        unordered_dates = np.array([[int(cell) for cell in row.split('/')] for row in list(results)])
+        ymd_mask = self.__probeDateOrder(unordered_dates)
+
+        if len(ymd_mask) == 2:  # MMDD
+            ymd_mask[ymd_mask != 'd'] = 'm'  # 唯一不大于12的是月份
+            date_name = 'MMDD'
+        else:
+            date_name = 'YYMMDD'
+        date_pattern = {v: Anchor.__HyphenDateIdx[date_name][idx] for idx, v in enumerate(ymd_mask)}
+        date_pattern['name'] = date_name
+
         self.datePattern.update(date_pattern)
         self.dateRegExp = re.compile(self.__HyphenDateSpecs[self.datePattern['name']])
         self.datePattern['left'] = True if left[True] > left[False] else False
@@ -202,68 +212,64 @@ class Anchor(object):
     # 确定年月日的顺序, 依据包括：日期变化规律、4位是年、大于2位年的是日、唯一大于12的是年，唯一小于12的是月
     @staticmethod
     def __probeDateOrder(unordered_dates, filename=''):
-        unordered_dates = list(unordered_dates)
-        unordered_dates = np.array([[int(cell) for cell in row.split('/')] for row in unordered_dates])
-
         date_value = np.max(unordered_dates, axis=0)
         date_len = unordered_dates.shape[1]
         ymd_mask = np.array(['' for i in range(date_len)])
 
-        # 先按照日期的前后变化找规律(如先后两行出现18-2-3、18-2-4)
-        diff_ = (date_value - np.min(unordered_dates, axis=0))
-        if np.max(diff_) > 0:  # 时间戳起码是跨天的，变化最大的一定是日
-            ymd_mask[diff_ == np.max(diff_)] = 'd'
-        else:  # 所有时间戳都是同一天的, 拿日期数字的值碰碰运气
-            this_year = int(time.strftime('%y'))
-            ymd_mask[date_value > 2000] = 'y'  # 4位肯定是年份
-            date_value[date_value > 2000] = date_value[date_value > 2000] - 2000
-            ymd_mask[date_value == 0] = 'y'  # 0是None转过来的，肯定是年
-            date_value[date_value == 0] = this_year
-            ymd_mask[date_value > this_year] = 'd'  # 大于2位年份、小于4位年份，肯定是日
-
+        # 先拿最大的年月日数字的值碰碰运气
+        this_year = int(time.strftime('%y'))
+        ymd_mask[date_value > 2000] = 'y'  # 4位肯定是年份
+        ymd_mask[date_value == 0] = 'y'  # 0是None转过来的，肯定是年
+        date_value[date_value == 0] = this_year
+        date_value[date_value > 2000] = date_value[date_value > 2000] - 2000  # 统一成两位年份
+        ymd_mask[date_value > this_year] = 'd'  # 大于2位年份、小于4位年份，肯定是日
         ymd_order = {v: idx for idx, v in enumerate(list(ymd_mask))}
-        if ymd_order.get('d') is not None:  # 只要日找到，年月肯定可区分(年份数字一定大于月份数字,2013年以后）
+
+        # 未找到日，按照日期的前后变化找规律(如先后两行出现18-2-3、18-2-4)
+        if ymd_order.get('d') is None:
+            diff_ = (date_value - np.min(unordered_dates, axis=0))
+            if np.max(diff_) > 0:  # 时间戳起码是跨天的，变化最大的一定是日
+                ymd_mask[diff_ == np.max(diff_)] = 'd'
+
+        # 只要日找到，年月肯定可区分(年份数字一定大于月份数字,2013年以后）
+        if ymd_order.get('d') is not None:
             ymd_mask[ymd_mask != 'd'] = ''  # 先把可能未知的年、月清零
             date_value[ymd_mask == 'd'] = 0  # 比较大小前屏蔽掉已知的日
             ymd_mask[date_value == np.max(date_value)] = 'y'  # 大的是年
             ymd_mask[ymd_mask == ''] = 'm'  # 剩下的是月
-        else:  # 未找到日期，所有时间戳都是同一天的, 接着检查日期数字的值
-            less_than12_times = date_value[date_value <= 12].shape[0]  # 小于12的个数
-            if less_than12_times == 1:
-                ymd_mask[date_value <= 12] = 'm'  # 唯一不大于12的是月份
-            elif less_than12_times == 2:
-                ymd_mask[date_value > 12] = 'y'  # 唯一大于12的是年份
-            elif date_value[date_value == np.max(date_value)].shape[0] == 1:  # 最大值当作年
-                ymd_mask[date_value == np.max(date_value)] = 'y'
+            return ymd_mask
 
-            # 无法完全确定的，按可能性大小设置
-            ymd_order = {v: idx for idx, v in enumerate(list(ymd_mask))}
-            if date_len == 2:  # MMDD
-                if less_than12_times == 1:
-                    ymd_mask[date_value > 12] = 'd'  # 唯一不大于12的是月份
-                else:
-                    ymd_mask = np.array(['m', 'd'])
-                    G.log.warning('Failed to probe date format for the single date:%d-%d), using %s instead. %s'
-                                  % (date_value[0], date_value[1], '-'.join([x + x for x in ymd_mask]), filename))
-            else:  # YYMMDD
-                if ymd_order.get('m') == 0 or ymd_order.get('y') == 2:
-                    ymd_mask = np.array(['m', 'd', 'y'])
-                elif ymd_order.get('m') == 2:
-                    ymd_mask = np.array(['y', 'd', 'm'])
-                elif ymd_order.get('y') == 1:
-                    ymd_mask = np.array(['d', 'y', 'm'])
-                else:
-                    ymd_mask = np.array(['y', 'm', 'd'])
-                G.log.warning('Failed to probe date format for the single:%d-%d-%d), using %s instead. %s'
-                              % (date_value[0], date_value[1], date_value[2], '-'.join([x + x for x in ymd_mask]),
-                                 filename))
+        less_than12_times = date_value[date_value <= 12].shape[0]  # 小于12的个数
+        if less_than12_times == 1:
+            ymd_mask[date_value <= 12] = 'm'  # 唯一不大于12的是月份
+        elif less_than12_times == 2:
+            ymd_mask[date_value > 12] = 'y'  # 唯一大于12的是年份
+        elif date_value[date_value == np.max(date_value)].shape[0] == 1:  # 最大值当作年
+            ymd_mask[date_value == np.max(date_value)] = 'y'
+
+        # MMDD无法完全确定的，按可能性大小设置
+        ymd_order = {v: idx for idx, v in enumerate(list(ymd_mask))}
         if date_len == 2:  # MMDD
-            ymd_mask[ymd_mask != 'd'] = 'm'  # 唯一不大于12的是月份
-        date_name = 'MMDD' if date_len == 2 else 'YYMMDD'
-        result = {v: Anchor.__HyphenDateIdx[date_name][idx] for idx, v in enumerate(ymd_mask)}
-        result['name'] = date_name
+            if less_than12_times == 1:
+                ymd_mask[date_value > 12] = 'd'  # 唯一不大于12的是月份
+            else:
+                ymd_mask = np.array(['m', 'd'])
+                G.log.warning('Failed to probe date format for the single date:%d-%d), using %s instead. %s'
+                              % (date_value[0], date_value[1], '-'.join([x + x for x in ymd_mask]), filename))
+            return ymd_mask
 
-        return result
+        # YYMMDD无法完全确定的，按可能性大小设置
+        if ymd_order.get('m') == 0 or ymd_order.get('y') == 2:
+            ymd_mask = np.array(['m', 'd', 'y'])
+        elif ymd_order.get('m') == 2:
+            ymd_mask = np.array(['y', 'd', 'm'])
+        elif ymd_order.get('y') == 1:
+            ymd_mask = np.array(['d', 'y', 'm'])
+        else:
+            ymd_mask = np.array(['y', 'm', 'd'])
+        G.log.warning('Failed to probe date format for the single:%d-%d-%d), using %s instead. %s'
+                      % (date_value[0], date_value[1], date_value[2], '-'.join([x + x for x in ymd_mask]), filename))
+        return ymd_mask
 
     # 返回锚点的日期时间值
     def getTimeStamp(self, line):

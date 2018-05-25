@@ -23,14 +23,10 @@ from config import Workspaces as G
 
 
 class Dbc(object):
-    db_type, db_addr, db_user, db_passwd = G.cfg.get('General', 'db').split(':')
 
     def __init__(self):
-        self.conn = None
-        self.cursor = None
-        if self.db_type == 'mysql':
-            self.conn = pymysql.connect(self.db_addr, self.db_user, self.db_passwd, 'ailog-backend', charset='utf8')
-            self.cursor = self.conn.cursor()
+        self.conn = DbUtil.dbConnect()
+        self.cursor = self.conn.cursor()
 
     def __enter__(self):
         return self.cursor
@@ -47,8 +43,8 @@ class FileUtil(object):
     
     """
     # 解压文件
-    @classmethod
-    def extractFile(cls, tar_file, to_):
+    @staticmethod
+    def extractFile(tar_file, to_):
         tar = tarfile.open(tar_file)
         tar.extractall(path=to_)
         tar.close()
@@ -141,6 +137,41 @@ class FileUtil(object):
             rule_sets.append((ruleset_name, replace_rules, stop_words, k_list))
         return rule_sets
 
+    # 对一个样本(字符串)进行处理，返回词表[word]
+    @staticmethod
+    def getWords(document, rule_set):
+        """
+        split document into words by rules in
+        :param document:
+        :param rule_set:
+        :return:
+        """
+        # 按照replace_rules对原文进行预处理，替换常用变量，按标点拆词、滤除数字等等
+        keep_words = []
+        for (replace_from, replace_to) in rule_set[1]:
+            if replace_to == 'KEEP':  # 保留变量原值，防止被分词、去掉数字等后续规则破坏
+                keep_word = replace_from.findall(document)
+                if not keep_word:  # 未找到，无需进行后续替换
+                    continue
+                keep_words += [word[0] for word in keep_word]  # 保存找到的原值
+                replace_to = ''  # 让后续替换在原文中去掉原值
+            document = replace_from.sub(replace_to, document)
+        words = [w for w in document.split() if len(w) > 1 and w.lower() not in rule_set[2]]  # 分词,滤除停用词和单字母
+
+        # 实现k-shingle逻辑，把连续多个词合并为一个词
+        k_shingles = []
+        for k in rule_set[3]:
+            if k == 1:
+                k_shingles = words
+                continue
+            for i in range(len(words) - k):
+                k_shingle = ''
+                for j in range(k):
+                    k_shingle += words[i + j]
+                k_shingles += ([k_shingle])
+
+        # 合并返回单词列表
+        return keep_words + k_shingles
     # 聚类，得到各簇SSE（sum of the squared errors)，作为手肘法评估确定ｋ的依据
     @staticmethod
     def pilotClustering(classifier_section_name, vectors, k_from=1):
@@ -253,15 +284,14 @@ class FileUtil(object):
         return classified_files, unclassified_files
 
     @staticmethod
-    def getPredictResult(model, c_names, c_boundaries, c_quantiles, vectors):
+    def predict(kmeans, c_boundaries, c_quantiles, vectors):
         norm_factor = - vectors.shape[1]  # 按字典宽度归一化
 
-        predicted_labels = model.predict(vectors)  # 使用聚类模型预测记录的类别
-        predicted_names = [c_names[label] for label in predicted_labels]
+        predicted_labels = kmeans.predict(vectors)  # 使用聚类模型预测记录的类别
         confidences = []
         distances = []
         for i, v in enumerate(vectors):
-            distance = model.score([v]) / norm_factor
+            distance = kmeans.score([v]) / norm_factor
             distances.append(distance)
             category = predicted_labels[i]
             confidences.append((c_boundaries[category] - distance) / c_quantiles[category])
@@ -269,7 +299,7 @@ class FileUtil(object):
         confidences[confidences > 99.9] = 99.9
         confidences[confidences < -99.9] = -99.9
 
-        return predicted_labels, predicted_names, confidences, distances
+        return predicted_labels, confidences, distances
 
     # 同类文件合并到to_目录下，供后续记录聚类使用
     @staticmethod
@@ -437,10 +467,10 @@ class DbUtil(object):
     # 连接数据库
     @classmethod
     def dbConnect(cls):
-        db_type, db_addr, db_user, db_passwd = G.cfg.get('General', 'db').split(':')
+        type_, host, usr, password, database = G.cfg.get('General', 'db').split(':')
         try:
-            if db_type == 'mysql':
-                db = pymysql.connect(db_addr, db_user, db_passwd, 'ailog', charset='utf8')
+            if type_ == 'mysql':
+                db = pymysql.connect(host, usr, password, database, charset='utf8')
                 return db
             else:
                 return None
@@ -461,6 +491,7 @@ class DbUtil(object):
             update_data = ''
             for col_name, cell_data in zip(col_names, row):
                 str_data = 'null,' if cell_data is None else '"%s",' % str(cell_data)
+                str_data = str_data.replace('\\', '\\\\')
                 insert_data += str_data
                 update_data += col_name + '=' + str_data
 
@@ -491,14 +522,25 @@ class DbUtil(object):
             cursor.execute(sql)
 
     @staticmethod
-    def dbWildcardLogFiles(cursor, wildcard_log_files):
+    def dbInsertOrUpdateLogFlow(cursor, wildcard_log_files):
         for wildcard_log_file in wildcard_log_files:
             host, remote_path, filename, model_id, category_id, anchor = wildcard_log_file
+            match_ = re.match('flow(\d+)\.log', filename)
             remote_path = remote_path.replace('\\', '\\\\')
             host = '"%s"' % host
             remote_path = '"%s"' % remote_path
             filename = '"%s"' % filename
             anchor = '"%s"' % anchor
+            if match_:  # 是已有日志流,重新聚类后的情况
+                flow_id = int(match_.group(1))
+                cursor.execute('SELECT COUNT(id) from tbl_log_flow where id=%d' % flow_id)
+                if cursor.fetchall()[0][0]:
+                    sql = 'UPDATE tbl_log_flow SET host=%s, path=%s, wildcard_name=%s, model_id=%s, category_id=%s, anchor=%s WHERE id=%d' % (
+                        host, remote_path, filename, model_id, category_id, anchor, flow_id)
+                    cursor.execute(sql)
+                    continue
+
+            # 常规情况
             sql = 'INSERT INTO  tbl_log_flow(host, path, wildcard_name, model_id, category_id, anchor) VALUES(%s, %s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE model_id=%s, category_id=%s, anchor=%s' % (
                 host, remote_path, filename, model_id, category_id, anchor, model_id, category_id, anchor)
             cursor.execute(sql)

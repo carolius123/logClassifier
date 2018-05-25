@@ -12,6 +12,7 @@ import threading
 import time
 
 from FileClassifier import FileClassifier
+from RecordClassifier import RecordClassifier
 from anchor import Anchor
 from config import Workspaces as G
 from utilites import Dbc, FileUtil, DbUtil
@@ -39,25 +40,26 @@ class OnlineService(object):
     @staticmethod
     def deamon():
         G.log.info('OnlineService::deamon started, ready for accept new log flow.')
-        while True:
-            time.sleep(60)
-            G.log.debug('I am alive')
+        # while True:
+        #     time.sleep(60)
+        #     G.log.debug('I am alive')
 
     # dispatch a new thread to a new flow
     def dispatcher(self, source_id, data_flow, host=None, path=None, wildcard_name=None):
         source_id = str(source_id)
-        if self.__isRunning(source_id):
+        if self.__threadExist(source_id):
             G.log.warning('Service-source[%d-%s] is running when new connection come, Ignore the new one',
                           self.service_id, source_id)
             return False
 
         flow_id, flow_status = self.getFlowID(source_id, host, path, wildcard_name)
-        t = threading.Thread(target=self.threadLogFlow, args=(flow_id, source_id, flow_status, data_flow))
-        self.threads[source_id] = t
-        t.start()
+        self.logFlowThread(flow_id, source_id, flow_status, data_flow)
+        # t = threading.Thread(target=self.logFlowThread, args=(flow_id, source_id, flow_status, data_flow))
+        # self.threads[source_id] = t
+        # t.start()
 
     # 检查该流的处理线程是否活着
-    def __isRunning(self, source_id):
+    def __threadExist(self, source_id):
         if source_id not in self.threads.keys():
             return False
 
@@ -66,16 +68,16 @@ class OnlineService(object):
         return result
 
     # thread to deal a data flow
-    def threadLogFlow(self, flow_id, source_id, status, data_flow):
+    def logFlowThread(self, flow_id, source_id, status, data_flow):
         G.log.info('Thread for log flow[%d-%d-%s] started at %s', flow_id, self.service_id, source_id, status)
         if status == '未锚定':
-            status, file_name = self.bufferFlow(flow_id, source_id, status, data_flow)
+            status, file_name = self.cacheLogFile(flow_id, status, data_flow)
             if status == 'OK':  # 缓存行数已经足够
-                status = self.predict(flow_id, file_name)
+                status = self.predictFileCategory(flow_id, file_name)
         if status == '未分类':
-            status = self.bufferFlow(flow_id, source_id, status, data_flow)[0]
+            status = self.cacheLogFile(flow_id, status, data_flow)[0]
         if status == '活动中':
-            status = self.working(flow_id, status, data_flow)
+            RecordClassifier.dispatcher(flow_id, data_flow)
 
         G.log.info('Thread for log flow[%d-%d-%s] terminated at %s', flow_id, self.service_id, source_id, status)
         if source_id in self.threads.keys():
@@ -142,8 +144,8 @@ class OnlineService(object):
         return id_, '未锚定'
 
     # 把流数据缓存到文件中 ,并记录已经缓存的行数和字符数
-    def bufferFlow(self, flow_id, source_id, flow_status, data_flow):
-        filename = 'flow%d-%d-%s.log' % (flow_id, self.service_id, source_id)
+    def cacheLogFile(self, flow_id, flow_status, data_flow):
+        filename = 'flow%d.log' % flow_id
         if flow_status == '未锚定':
             path = G.inbox
         else:
@@ -177,8 +179,8 @@ class OnlineService(object):
         result = cursor.fetchone()
         return result
 
-    # 文件分类预测
-    def predict(self, flow_id, inbox_file):
+    # 新日志流缓存到一定行数后,预测文件分类
+    def predictFileCategory(self, flow_id, inbox_file):
         try:  # 计算时间戳锚点, 滤掉没有锚点的文件
             anchor = Anchor(inbox_file)
         except UserWarning as err:
@@ -201,8 +203,9 @@ class OnlineService(object):
         common_file_fullname = os.path.join(path, common_name)
         shutil.move(inbox_file, common_file_fullname)
 
-        classified_files, unclassified_files = FileUtil.predictFiles(self.models, [
-            common_file_fullname])  # 进行分类预测. classified_files [[model_id, common_name, category, category_name, confidence, distance]], unclassified_files [common_name]
+        classified_files, unclassified_files = FileUtil.predictFiles(self.models, [common_file_fullname])
+        # classified_files [[model_id, common_name, category, category_name, confidence, distance]]
+        # unclassified_files [common_name]
 
         with Dbc() as cursor:
             file2merged = [[file_fullname, anchor.name, anchor.colSpan[0], anchor.colSpan[1], common_file_fullname]]
@@ -214,35 +217,36 @@ class OnlineService(object):
                 status = '活动中'
                 model_id, _, category_id, category_name, _, _ = classified_files[0]
                 G.log.info('log flow[%d-%d] classified to [%d-%s]', self.service_id, flow_id, model_id, category_name)
-
             else:
                 status = '未分类'
                 model_id, category_id = None, None
                 G.log.info('log flow[%d-%d] can not to be classified', self.service_id, flow_id)
-            DbUtil.dbUpdFlow(cursor, flow_id, ['status', 'model_id', 'category_id', 'anchor'],
-                             [status, model_id, category_id, anchor_info])
+
+            col_names = ['status', 'model_id', 'category_id', 'anchor']
+            col_values = [status, model_id, category_id, anchor_info]
+            DbUtil.dbUpdFlow(cursor, flow_id, col_names, col_values)
 
         return status
 
-    @staticmethod
-    def working(flow_id, flow_status, data_flow):
-        line = ''
-        for line in data_flow:
-            pass
-        print('last Line:', line)
-        time.sleep(300)
-        return '活动中'
-
 
 if __name__ == '__main__':
+    # wildcard_log_files = [
+    #     ['192.168.1.1','d:\\app','flow1035.log',1,1,'COLON:1:12'],
+    #     ['192.168.1.2', 'd:\\app', 'flow12332343434.log', 1, 1, 'COLON:1:12'],
+    # ]
+    # with Dbc() as cursor:
+    #     DbUtil.dbInsertOrUpdateLogFlow(cursor, wildcard_log_files)
+
     ols = OnlineService()
-    ols.dispatcher('abc', open('D:\\home\\suihf\\data\\fc28', 'r', encoding='utf-8'))
-    ols.dispatcher('abc', open('D:\\home\\suihf\\data\\fc28', 'r', encoding='utf-8'))
-    ols.dispatcher('abc', open('D:\\home\\suihf\\data\\fc28', 'r', encoding='utf-8'))
-    ols.dispatcher('abc', open('D:\\home\\suihf\\data\\fc28', 'r', encoding='utf-8'))
-    ols.dispatcher('def', open(
-        'D:/home/suihf/data/l0inputs/10.20.23.139/home/cims/domains/ip_ap_dm/servers/ApServer/logs/access.log00720',
-        'r', encoding='utf-8'))
-    ols.dispatcher('xxx', open(
-        'D:/home/suihf/data/l0inputs/10.20.23.139/home/cims/domains/ip_ap_dm/servers/ApServer/logs/ApServer.log', 'r',
-        encoding='utf-8'))
+    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
+                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
+    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
+                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
+    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
+                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
+    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
+                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
+    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
+                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
+    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
+                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')

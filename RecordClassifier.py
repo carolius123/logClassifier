@@ -6,6 +6,7 @@
 
 
 import os
+import time
 from tempfile import TemporaryFile
 
 import numpy as np
@@ -17,31 +18,22 @@ from sklearn.externals import joblib
 
 from anchor import Anchor
 from config import Workspaces as G
-from utilites import FileUtil
+from utilites import Dbc, FileUtil
 
 
 # 对一个数千到数十万行的文件中的记录进行聚类，形成聚类模型
 class RecordClassifier(object):
     """
-    新建对象或者调用trainModel方法，可以生成Categorizer模型
-    调用predict方法，可以预测新记录的类型及其置信度
-    $DATA/models/l2file_info.csv：记录(\t分割)每个样本文件名称、定界符位置
-    $DATA/l2cache/: 存储各样本文件。每个样本文件由同类日志原始样本合并而成
-    1. 日志文件中记录的识别。每条记录大都会在第一行特定位置输出日期和时间，因此以特定位置的时间戳(hh:mm:ss)判断上一记录
-       的结束和下一记录的开始
-    2. 记录聚类的首要目标是把程序执行到某处输出的记录汇聚成一类。程序在某点输出日志，大致会包含几种信息：
-    2.1 日期、时间等几乎所有记录都包含的共有信息：这些对聚类结果没有影响，不必单独考虑
-    2.2 常数字符串和枚举型数据(如INFO、ERROR等): 这是这一类记录最典型的独有特征，应尽量突出其在聚类中的比重
-    2.3 URL、IP、Java包、path等变量：应尽量识别出来并归一化成常数字符串，改善聚类效果
-    2.4 字符串变量(应用系统的数据)和数字变量：上两类有效特征在每个记录中不会超过10个，字符串/数字变量可能会很多，这会严重
-         干扰聚类效果、影响运算速度，应尽量减少。数字可简单滤除。字符串变量可考虑去掉dfs字典中低频词
+    以模型文件名为参数创建对象或者调用loadModel方法，可装载rc模型
+    以样本文件名或样本文件列表为参数创建对象,或者调用buildModel方法, 以该这些文件为样本聚类生成rc模型
+    以日志流未参数调用predictRecord方法, 迭代返回每条记录及其时间戳, 类型及其置信度
     3. 后续处理可能有价值的目标包括：
     3.1 数字变量中可能包含错误码、代码等高值信息，可考虑提取和利用的手段
     3.2 对于记录数特别多的类别(太粗),可根据枚举型、IP、URL、错误码等进一步细化分类
     3.4 数字变量中可能包含时长、数量等指标数据，可考虑提取和利用的手段
     """
     __ClassName = 'RecordClassifier'
-    __LeastDocuments = G.cfg.getint(__ClassName, 'LeastRecords')  # 样本数小于该值，没有必要聚类
+    leastDocuments = G.cfg.getint(__ClassName, 'LeastRecords')  # 样本数小于该值，没有必要聚类
     __LeastTokens = G.cfg.getint(__ClassName, 'LeastTokens')  # 字典最少词数，低于此数没必要聚类
     __KeepN = G.cfg.getint(__ClassName, 'KeepN')  # 字典中最多词数，降低计算量
     __NoBelow = G.cfg.getfloat(__ClassName, 'NoBelow')  # 某词出现在文档数低于该比例时，从字典去掉，以排除干扰，降低计算量
@@ -50,45 +42,67 @@ class RecordClassifier(object):
     __MaxCategory = G.cfg.getint(__ClassName, 'MaxCategory')  # 尝试聚类的最大类别，以降低计算量
     __Quantile = G.cfg.getfloat(__ClassName, 'Quantile')  # 类别的边界，该类中以该值为分位数的点，作为该类的边界
 
-    def __init__(self, model_file='', samples_file='', anchor=None):
+    def __init__(self, model_or_sample):
         self.ruleSet = None  # 处理文件正则表达式
         self.dictionary = None  # 字典Dictionary
-        self.models = None  # 聚类模型 KMeans
+        self.model = None  # 聚类模型 KMeans
         self.alias = None  # cluster名称
         self.percent = None  # 该类别数量占比
         self.boundaries = None  # 最远点到(0.8)分位点距离平方
         self.quantiles = None  # (0.8)分位点到中心点距离平方
-        self.anchor = anchor  # 时间戳锚点Anchor
+        self.anchor = None  # 时间戳锚点Anchor
 
-        self.tmp_cache_file = None
-
-        if os.path.exists(model_file):  # 从模型文件装载模型
-            self.anchor, self.ruleSe, self.dictionary, self.models, self.alias, self.percent, self.boundaries, self.quantiles = joblib.load(
-                model_file)
-
-        if os.path.exists(samples_file):  # 从样本训练模型
-            if not self.anchor:  # 从样本文件中提取时间戳锚点
-                self.anchor = Anchor(samples_file, probe_date=True)
-            self.buildModel(samples_file)
-
-    def buildModel(self, samples_file):
-        for self.ruleSet in FileUtil.loadRuleSets():
-            # 日志文件预处理为记录向量,并形成字典。vectors是稀疏矩阵(行-记录，列-词数)
-            self.dictionary, vectors = self.__buildVectors(samples_file)
-            if not self.dictionary:  # 字典太短，换rule set重新采样
-                continue
-            start_k = int(min(len(self.dictionary) / 10, vectors.shape[0] / 100))
-            k_ = self.pilotClustering(self.__ClassName, vectors, start_k)  # 多个K值试聚类，返回最佳K
-            if k_:  # 找到合适的K，跳出循环, 否则换rule set重新采样
-                break
+        if type(model_or_sample) is str:
+            if not os.path.exists(model_or_sample):
+                G.log.warning('[err]File not found. No model loaded!')
+                return
+            try:  # 从模型文件装载模型
+                self.anchor, self.ruleSe, self.dictionary, self.model, self.alias, self.percent, self.boundaries, self.quantiles = joblib.load(
+                    model_or_sample)
+                return
+            except Exception:
+                sample_file_list = [model_or_sample]
         else:
-            raise UserWarning('Cannot generate qualified corpus by all RuleSets')
+            sample_file_list = model_or_sample
 
-        self.models, self.percent, self.boundaries, self.quantiles = FileUtil.buildModel(self.__ClassName, k_, vectors)
+        if type(sample_file_list) is not list:
+            raise UserWarning('parameter should be model/sample file name, sample file name list. No model loaded!')
+
+        self.tmp_cache_file = None  # 样本临时文件指针,需跨多层使用,参数传递麻烦
+        self.buildModel(sample_file_list)
+
+    def buildModel(self, samples_file_list):
+        """
+    日志文件中每条记录大都会在第一行特定位置输出日期和时间，因此以特定位置的时间戳判断上一记录的结束和下一记录的开始
+    记录聚类的首要目标是把程序执行到某处输出的记录汇聚成一类。程序在某点输出日志，大致会包含几种信息：
+    - 日期、时间等几乎所有记录都包含的共有信息：这些对聚类结果没有影响，不必单独考虑
+    - 常数字符串和枚举型数据(如INFO、ERROR等): 这是这一类记录最典型的独有特征，应尽量突出其在聚类中的比重
+    - URL、IP、Java包、path等变量：应尽量识别出来并归一化成常数字符串，改善聚类效果
+    - 字符串变量(应用系统的数据)和数字变量：上两类有效特征在每个记录中不会超过10个，字符串/数字变量可能会很多，这会严重干扰聚类效果、影响运算速度，应尽量减少。数字可简单滤除。字符串变量可考虑去掉dfs字典中低频词
+        :param samples_file_list: sample file or sample file list.
+        """
+        try:
+            for self.ruleSet in FileUtil.loadRuleSets():
+                # 日志文件预处理为记录向量,并形成字典。vectors是稀疏矩阵(行-记录，列-词数)
+                self.dictionary, vectors = self.__buildVectors(samples_file_list)
+                if not self.dictionary:  # 字典太短，换rule set重新采样
+                    continue
+                start_k = int(min(len(self.dictionary) / 10, vectors.shape[0] / 100))
+                k_ = self.__pilotClustering(self.__ClassName, vectors, start_k)  # 多个K值试聚类，返回最佳K
+                if k_:  # 找到合适的K，跳出循环, 否则换rule set重新采样
+                    break
+            else:
+                raise UserWarning('Cannot generate qualified corpus by all RuleSets')
+        except UserWarning:
+            samples_file = os.path.splitext(os.path.split(samples_file_list[0])[1])[0]
+            self.__saveDb(samples_file, '无模型')  # 更新本模型对应的日志文件类型的数据库记录
+            raise
+
+        self.model, self.percent, self.boundaries, self.quantiles = FileUtil.buildModel(self.__ClassName, k_, vectors)
         self.alias = ['rc' + str(i) for i in range(len(self.quantiles))]  # 簇的别名，默认为rci，可人工命名
 
-        self.__saveModel(samples_file)
-        self.__saveResult(samples_file, vectors)
+        self.__saveModel(samples_file_list[0])
+        self.__saveResult(samples_file_list[0], vectors)
 
     # 文档向量化。dataset-[document:M]-[[word]]-[[token]]-[BoW:M]-corpus-tfidf-dictionary:N, [vector:M*N]
     def __buildVectors(self, samples_file):
@@ -99,7 +113,7 @@ class RecordClassifier(object):
             dct.add_documents([document])
             self.tmp_cache_file.write(' '.join(document) + '\n')
             if doc_idx % 500 == 0: G.log.debug('Processed %d records in %s', doc_idx, samples_file)
-        if dct.num_docs < self.__LeastDocuments:  # 字典字数太少或文档数太少，没必要聚类
+        if dct.num_docs < self.leastDocuments:  # 字典字数太少或文档数太少，没必要聚类
             self.tmp_cache_file.close()
             raise UserWarning('Too few records[%d]' % dct.num_docs)
 
@@ -127,36 +141,42 @@ class RecordClassifier(object):
         return dct, vectors
 
     # 预处理文件，迭代方式返回某条记录的词表.
-    def __buildDocument(self, samples_file):
+    def __buildDocument(self, samples_file_list):
         line_idx, record = 0, ''
-        for line_idx, next_line in enumerate(open(samples_file, 'r', encoding='utf-8')):
-            try:
-                # 判断定界位置是否为恰好是时间戳，形成一条完整record
-                absent = self.anchor.getTimeStamp(next_line) is None
-                if absent or (record == ''):
-                    if absent ^ (record == ''):  # 开始行是定界，或者当前行不是定界行，表示尚未读到下一记录
-                        record += next_line
-                    continue
+        for samples_file in samples_file_list:
+            if not self.anchor:  # 从样本文件中提取时间戳锚点
+                self.anchor = Anchor(samples_file, probe_date=True)
 
-                document = G.getWords(record, rule_set=self.ruleSet)  # 完整记录Record(变量替换/停用词/分词/Kshingle)-〉[word]
-                # 得到词表，并准备下次循环
-                record = next_line  # 当前行存入当前记录
-                yield document, line_idx
-            except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
-                G.log.exception('Record [%s] ignored due to the following error:', record)
-                record = ''  # 清空并丢弃现有记录
-                continue
-        if record != '':  # 处理最后一个记录
-            try:
-                # 完整记录Record(变量替换/停用词/分词/Kshingle)-〉[word]
-                yield G.getWords(record, rule_set=self.ruleSet), line_idx
-            except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
-                G.log.exception('Record [%s] ignored due to the following error:', record)
+            for line_idx, next_line in enumerate(open(samples_file, 'r', encoding='utf-8')):
+                try:
+                    # 判断定界位置是否为恰好是时间戳，形成一条完整record
+                    absent = self.anchor.getTimeStamp(next_line) is None
+                    if absent or (record == ''):
+                        if absent ^ (record == ''):  # 开始行是定界，或者当前行不是定界行，表示尚未读到下一记录
+                            record += next_line
+                        continue
+
+                    # 完整记录Record(变量替换/停用词/分词/Kshingle)-〉[word]
+                    document = FileUtil.getWords(record, rule_set=self.ruleSet)
+                    # 得到词表，并准备下次循环
+                    record = next_line  # 当前行存入当前记录
+                    yield document, line_idx
+                except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
+                    G.log.exception('Record [%s] ignored due to the following error:', record)
+                    record = ''  # 清空并丢弃现有记录
+                    continue
+            # 处理最后一个记录
+            if record != '':
+                try:
+                    # 完整记录Record(变量替换/停用词/分词/Kshingle)-〉[word]
+                    yield FileUtil.getWords(record, rule_set=self.ruleSet), line_idx
+                except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
+                    G.log.exception('Record [%s] ignored due to the following error:', record)
         raise StopIteration()
 
     # 聚类，得到各簇SSE（sum of the squared errors)，作为手肘法评估确定ｋ的依据
     @staticmethod
-    def pilotClustering(classifier_section_name, vectors, from_=1):
+    def __pilotClustering(classifier_section_name, vectors, from_=1):
         norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度标准化因子，保证不同向量的可比性
         termination_inertia = G.cfg.getfloat(classifier_section_name, 'NormalizedTerminationInertia') * norm_factor
 
@@ -189,17 +209,26 @@ class RecordClassifier(object):
     # 保存模型和结果
     def __saveModel(self, samples_file_fullname):
         samples_file = os.path.splitext(os.path.split(samples_file_fullname)[1])[0]
-        joblib.dump((self.anchor, self.ruleSet, self.dictionary, self.models, self.alias, self.percent,
-                     self.boundaries, self.quantiles),
-                    os.path.join(G.projectModelPath, samples_file + '.mdl'))  # 保存模型，供后续使用
+        joblib.dump((self.anchor, self.ruleSet, self.dictionary, self.model, self.alias, self.percent, self.boundaries,
+                     self.quantiles), os.path.join(G.projectModelPath, samples_file + '.mdl'))  # 保存模型，供后续使用
+        self.__saveDb(samples_file, '无指标')  # 更新本模型对应的日志文件类型的数据库记录
+
         self.dictionary.save_as_text(os.path.join(G.logsPath, samples_file + '.dic.csv'))  # 保存文本字典，供人工审查
         df = DataFrame({'类型': self.alias, '样本占比': self.percent, '分位点距离': self.quantiles, '边界-分位点距离': self.boundaries})
         df.to_csv(os.path.join(G.logsPath, samples_file + '.mdl.csv'), sep='\t', encoding='utf-8')  # 保存聚类模型，供人工审查
         G.log.info('Model saved to %s successful.', os.path.join(G.projectModelPath, samples_file + '.mdl'))
 
+    @staticmethod
+    def __saveDb(samples_file, status):
+        model_id = 1
+        fc_id = int(samples_file[2:])
+        with Dbc() as cursor:
+            sql = 'UPDATE file_class SET status="%s"  WHERE model_id=%d AND category_id=%d' % (status, model_id, fc_id)
+            cursor.execute(sql)
+
     def __saveResult(self, samples_file_fullname, vectors):
-        c_ids, c_names, confidences, distances = FileUtil.getPredictResult(self.models, self.alias, self.boundaries,
-                                                                           self.quantiles, vectors)
+        c_ids, confidences, distances = FileUtil.predict(self.model, self.boundaries, self.quantiles, vectors)
+        c_names = [self.alias[label] for label in c_ids]
         self.tmp_cache_file.seek(0)
         records = [line for line in self.tmp_cache_file]
         df = DataFrame({'Category': c_names, 'Confidence': confidences, 'Record': records})
@@ -212,14 +241,14 @@ class RecordClassifier(object):
         G.log.info('Result saved to %s successful.', os.path.join(G.logsPath, samples_file + '.out.csv'))
 
     # predict from txt file or txt data flow
-    def predict(self, data_stream):
+    def predictRecords(self, data_stream):
         """
          predict from file or list of lines，
         置信度最大99.99，如>1, 表示到中心点距离小于0.8分位点，非常可信；最小-99.99，如< 0距离大于最远点，意味着不属于此类
         :param data_stream: samples file name or data stream
-        :return: records [[category_id、category_alias, confidence, timestamp, record, bag_of_word]]
+        :return: records iterator of [timestamp, record category, confidence, record content]
         """
-        if not self.models:
+        if not self.model:
             raise UserWarning('Failed to predict: Model is not exist!')
 
         if type(data_stream) is str:  # 如输入文件名，读取内容，得到dataset
@@ -239,10 +268,16 @@ class RecordClassifier(object):
                             timestamp = next_timestamp
                         record += next_line
                     continue
-                result = self.__predictRecord(timestamp, record)
+
+                words = FileUtil.getWords(record, rule_set=self.ruleSet)
+                vectors = self.__buildVector([words])  # 计算向量[vector:Record*dictionary]
+                c_ids, confidences, distances = FileUtil.predict(self.model, self.boundaries, self.quantiles, vectors)
+                c_id, confidence, distance = c_ids[0], confidences[0], distances[0]
+                c_name = self.alias[c_id]
+
                 timestamp = next_timestamp  # 保存下一个时间戳
                 record = next_line  # 当前行存入当前记录，准备下次循环
-                yield result
+                yield timestamp, c_ids, c_name, confidences, distances, record, words
             except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
                 G.log.exception('Record [%s] ignored due to the following error:', record)
                 record = ''  # 清空并丢弃现有记录
@@ -250,21 +285,18 @@ class RecordClassifier(object):
         # 处理最后一行
         if record != '':
             try:
-                result = self.__predictRecord(timestamp, record)
-                yield result
+                words = FileUtil.getWords(record, rule_set=self.ruleSet)
+                vectors = self.__buildVector([words])  # 计算向量[vector:Record*dictionary]
+                c_ids, confidences, distances = FileUtil.predict(self.model, self.boundaries, self.quantiles, vectors)
+                c_id, confidence, distance = c_ids[0], confidences[0], distances[0]
+                c_name = self.alias[c_id]
+                yield timestamp, c_ids, c_name, confidences, distances, record, words
             except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
                 G.log.exception('Record [%s] ignored due to the following error:', record)
         raise StopIteration
 
-    def __predictRecord(self, timestamp, record):
-        words = G.getWords(record, rule_set=self.ruleSet)  # 完整记录Record(变量替换/停用词/分词/Kshingle)-〉[word]
-        vectors = self.__getVectors([words])  # 计算向量[vector:Record*dictionary]
-        c_ids, c_names, confidences, distances = FileUtil.getPredictResult(self.models, self.alias, self.boundaries,
-                                                                           self.quantiles, vectors)
-        return timestamp, c_ids[0], c_names[0], confidences[0], distances[0], record, words
-
     # 构造不归一的IF_IDF词袋和文档向量
-    def __getVectors( self, corpus ):
+    def __buildVector(self, corpus):
         tfidf_model = TfidfModel(dictionary=self.dictionary, normalize=False)
         vectors = np.zeros((len(corpus), len(self.dictionary)))
         for doc_idx, document in enumerate(corpus):
@@ -272,8 +304,87 @@ class RecordClassifier(object):
                 vectors[doc_idx, word_idx] = tf_idf_value
         return vectors
 
+    # 新的日志流连接建立后,如该日志流已有文件类型fc, 则被分发到本入口
+    @classmethod
+    def dispatcher(cls, flow_id, data_flow):
+        status, model_id, fc_id, rc_model = cls.__get_rc_model(flow_id)
+
+        # 尚未形成记录模型
+        if status == '无模型':
+            status = cls.__cacheLogRecords(model_id, fc_id, flow_id, data_flow)
+
+        # 缓存行数已经足够,本线程启动聚类
+        if status == 'OK':
+            prefix = 'fc%d' % fc_id
+            samples = sorted([os.path.join(G.l2_cache, f) for f in os.listdir(G.l2_cache) if f[:len(prefix)] == prefix])
+            try:
+                rc_model = RecordClassifier(samples)
+                status = '无指标'
+            except UserWarning:
+                status = '无模型'
+
+        # 别的线程正在算记录模型, 等待其完成
+        while status == '计算中':
+            time.sleep(60)
+            status, model_id, fc_id, rc_model = cls.__get_rc_model(flow_id)
+
+        if status in ['无指标', '无基线', '已完备']:
+            rc_model.process(data_flow)
+
+    # 把流数据缓存到文件中 ,并记录已经缓存的行数
+    @classmethod
+    def __cacheLogRecords(cls, model_id, fc_id, flow_id, data_flow):
+        file_fullname = os.path.join(G.l2_cache, 'fc%d-%d' % (fc_id, flow_id))
+        received_lines, now = 0, time.time()
+
+        with open(file_fullname, 'a', encoding='utf-8', errors='ignore') as fp:
+            for line in data_flow:
+                fp.write(line)
+                received_lines += 1
+                if time.time() - now > 30 and received_lines:
+                    status = cls.__dbUpdFileClass(model_id, fc_id, received_lines)
+                    if status != '无模型':
+                        return status
+                    received_lines, now = 0, time.time()
+            else:  # 数据流关闭
+                return cls.__dbUpdFileClass(model_id, fc_id, received_lines)
+
+    @staticmethod
+    def __dbUpdFileClass(model_id, fc_id, received_lines):
+        with Dbc() as cursor:
+            sql = 'SELECT status,total_lines from file_class WHERE model_id=%d AND category_id=%d' % (model_id, fc_id)
+            cursor.execute(sql)
+            status, total_lines = cursor.fetchone()
+            if status != '无模型':  # 被别的同类日志线程修改了状态
+                return status
+            least_lines = RecordClassifier.leastDocuments * 10
+            total_lines += received_lines
+            status = '计算中' if total_lines > least_lines else '无模型'
+            sql = 'UPDATE file_class SET total_lines=%d,status="%s" WHERE model_id=%d AND category_id=%d' % (
+                total_lines, status, model_id, fc_id)
+            cursor.execute(sql)
+            status = 'OK' if total_lines > least_lines else '无模型'
+        return status
+
+    @staticmethod
+    def __get_rc_model(flow_id):
+        with Dbc() as cursor:
+            sql = 'SELECT f.model_id,f.category_id,f.status FROM tbl_log_flow AS t, file_class as f WHERE t.model_id=f.model_id AND t.category_id=f.category_id AND id = %d' % flow_id
+            cursor.execute(sql)
+            result = cursor.fetchone()
+            model_id, fc_id, status = result
+
+        if status in ['无模型', '计算中']:
+            rc_model = None
+        else:
+            rc_model_file = os.path.join(G.modelPaths[model_id], 'fc%d.mdl' % fc_id)
+            rc_model = RecordClassifier(rc_model_file)
+        return status, model_id, fc_id, rc_model
+
+
 
 if __name__ == '__main__':
+    RecordClassifier(model_or_sample='D:\\home\\suihf\\data\\l2cache\\fc97')
     errors = 0
     filename, index = '', 0
     for index, filename in enumerate(os.listdir(G.l2_cache)):
@@ -281,9 +392,9 @@ if __name__ == '__main__':
             filename = os.path.join(G.l2_cache, filename)
             if os.path.isfile(filename):
                 G.log.info('[%d]%s: Record classifying...', index, filename)
-                rc = RecordClassifier(samples_file=filename)
+                rc = RecordClassifier([filename])
         except Exception as err:
             errors += 1
             G.log.error('%s ignored due to: %s', filename, str(err))
             continue
-    G.log.info('%d models built and stored in %s, %d failed.', G.projectModelPath, index + 1 - errors, errors)
+    G.log.info('%d model built and stored in %s, %d failed.', G.projectModelPath, index + 1 - errors, errors)

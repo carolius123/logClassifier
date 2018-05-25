@@ -44,7 +44,7 @@ class FileClassifier(object):
         elif os.path.isdir(model_file_or_samples_path):
             self.buildModel()
         else:
-            G.log.warning('No models loaded!')
+            G.log.warning('No model loaded!')
 
     def loadModel(self, model_file=G.projectFileClassifierModel):
         self.ruleSet, self.dictionary, self.statsScope, self.models, self.categories = joblib.load(model_file)
@@ -90,7 +90,7 @@ class FileClassifier(object):
         self.categories[0][key] = name
         self.__saveModel()
 
-    # 训练、生成模型并保存在$models/xxx.mdl中,dataset:绝对/相对路径样本文件名，或者可迭代样本字符流
+    # 训练、生成模型并保存在$model/xxx.mdl中,dataset:绝对/相对路径样本文件名，或者可迭代样本字符流
     def buildModel(self, from_path=G.l1_cache, k_=0):
         """
         Train and generate K-Means Model
@@ -121,16 +121,14 @@ class FileClassifier(object):
         self.categories = [names, percents, boundaries, quantiles]
         results = self.__getResult(vectors)
         # 保存模型文件和数据库
-        self.__saveModel()  # models saved to file
+        self.__saveModel()  # model saved to file
         with Dbc() as cursor:
             file_and_results = [self.common_filenames] + list(results)
-            classified_common_files, unclassified_common_files = FileUtil.splitResults(self.model_id,
-                                                                                       G.minFileConfidence,
-                                                                                       file_and_results)
-            DbUtil.dbUdFilesMerged(cursor, classified_common_files, unclassified_common_files)
+            classified, unclassified = FileUtil.splitResults(self.model_id, G.minFileConfidence, file_and_results)
+            DbUtil.dbUdFilesMerged(cursor, classified, unclassified)
             FileUtil.mergeFilesByClass(cursor, G.l2_cache)  # 同类文件合并到to_目录下
             wildcard_log_files = FileUtil.genGatherList(cursor)  # 生成采集文件列表
-            DbUtil.dbWildcardLogFiles(cursor, wildcard_log_files)
+            DbUtil.dbInsertOrUpdateLogFlow(cursor, wildcard_log_files)
 
     # 建立词典，同时缓存词表文件
     def __buildDictionary(self, new_dataset_path):
@@ -225,7 +223,7 @@ class FileClassifier(object):
 
         G.log.debug('Converting ' + file_fullname)
         for line_idx, line in enumerate(open(file_fullname, 'r', encoding=encoding)):
-            words = G.getWords(line, rule_set=self.ruleSet)
+            words = FileUtil.getWords(line, rule_set=self.ruleSet)
             document += words  # 生成词表
             lc.append(len(line))
             lw.append(len(words))
@@ -348,8 +346,11 @@ class FileClassifier(object):
 
     # 预测分类并计算可信度。<0 表示超出边界，完全不对，〉1完全表示比分位点还近，非常可信
     def __getResult(self, vectors):
-        c_names, _, c_boundaries, c_quantiles = self.categories
-        return FileUtil.getPredictResult(self.models, c_names, c_boundaries, c_quantiles, vectors)
+        names, _, boundaries, quantiles = self.categories
+        c_ids, confidences, distances = FileUtil.predict(self.models, boundaries, quantiles, vectors)
+        c_names = [names[label] for label in c_ids]
+
+        return c_ids, c_names, confidences, distances
 
     # 删除缓存文件
     def __clearCache(self):

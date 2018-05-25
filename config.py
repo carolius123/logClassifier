@@ -35,6 +35,7 @@ class Workspaces(object):
     l2_cache = os.path.join(__workspace, 'l2cache')  # 同类日志文件合并后保存在该目录下
     productModelPath = os.path.join(__workspace, cfg.get('General', 'ProductID'))  # 保存产品及通用模型数据
     projectModelPath = os.path.join(__workspace, cfg.get('General', 'ProjectID'))  # 保存生成的最终及中间模型及配置文件
+    modelPaths = [productModelPath, productModelPath]
     outputs = os.path.join(__workspace, 'outputs')  # 保存输出数据文件
 
     for __folder in [logsPath, inbox, l0_inputs, l1_cache, l2_cache, productModelPath, projectModelPath, outputs]:
@@ -78,39 +79,3 @@ class Workspaces(object):
         __fh.setFormatter(__formatter)
         log.addHandler(__fh)
     log.debug("stared!")
-
-    # 对一个样本(字符串)进行处理，返回词表[word]
-    @classmethod
-    def getWords(cls, document, rule_set):
-        """
-
-        :param document:
-        :param rule_set:
-        :return:
-        """
-        # 按照replace_rules对原文进行预处理，替换常用变量，按标点拆词、滤除数字等等
-        keep_words = []
-        for (replace_from, replace_to) in rule_set[1]:
-            if replace_to == 'KEEP':  # 保留变量原值，防止被分词、去掉数字等后续规则破坏
-                keep_word = replace_from.findall(document)
-                if not keep_word:  # 未找到，无需进行后续替换
-                    continue
-                keep_words += [word[0] for word in keep_word]  # 保存找到的原值
-                replace_to = ''  # 让后续替换在原文中去掉原值
-            document = replace_from.sub(replace_to, document)
-        words = [w for w in document.split() if len(w) > 1 and w.lower() not in rule_set[2]]  # 分词,滤除停用词和单字母
-
-        # 实现k-shingle逻辑，把连续多个词合并为一个词
-        k_shingles = []
-        for k in rule_set[3]:
-            if k == 1:
-                k_shingles = words
-                continue
-            for i in range(len(words) - k):
-                k_shingle = ''
-                for j in range(k):
-                    k_shingle += words[i + j]
-                k_shingles += ([k_shingle])
-
-        # 合并返回单词列表
-        return keep_words + k_shingles
