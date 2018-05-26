@@ -6,6 +6,7 @@
 
 
 import os
+import re
 import time
 from tempfile import TemporaryFile
 
@@ -57,8 +58,14 @@ class RecordClassifier(object):
                 G.log.warning('[err]File not found. No model loaded!')
                 return
             try:  # 从模型文件装载模型
-                self.anchor, self.ruleSe, self.dictionary, self.model, self.alias, self.percent, self.boundaries, self.quantiles = joblib.load(
+                self.anchor, self.ruleSet, self.dictionary, self.model, self.alias, self.percent, self.boundaries, self.quantiles = joblib.load(
                     model_or_sample)
+                match_ = re.match(r'fc(\d+)-(\d+)', os.path.split(model_or_sample)[1])
+                if not match_:
+                    raise UserWarning('Filename format err')
+                self.model_id, self.fc_id = match_.groups()
+                self.model_id, self.fc_id = int(self.model_id), int(self.fc_id)
+                self.model_path = os.path.join(G.modelPath, str(self.model_id))
                 return
             except Exception:
                 sample_file_list = [model_or_sample]
@@ -67,6 +74,13 @@ class RecordClassifier(object):
 
         if type(sample_file_list) is not list:
             raise UserWarning('parameter should be model/sample file name, sample file name list. No model loaded!')
+
+        match_ = re.match(r'fc(\d+)-(\d+)', os.path.split(sample_file_list[0])[1])
+        if not match_:
+            raise UserWarning('Filename format err')
+        self.model_id, self.fc_id = match_.groups()
+        self.model_id, self.fc_id = int(self.model_id), int(self.fc_id)
+        self.model_path = os.path.join(G.modelPath, str(self.model_id))
 
         self.tmp_cache_file = None  # 样本临时文件指针,需跨多层使用,参数传递麻烦
         self.buildModel(sample_file_list)
@@ -87,22 +101,21 @@ class RecordClassifier(object):
                 self.dictionary, vectors = self.__buildVectors(samples_file_list)
                 if not self.dictionary:  # 字典太短，换rule set重新采样
                     continue
-                start_k = int(min(len(self.dictionary) / 10, vectors.shape[0] / 100))
-                k_ = self.__pilotClustering(self.__ClassName, vectors, start_k)  # 多个K值试聚类，返回最佳K
+                # start_k = int(min(len(self.dictionary) / 10, vectors.shape[0] / 100))
+                k_ = self.__pilotClustering(self.__ClassName, vectors)  # 多个K值试聚类，返回最佳K
                 if k_:  # 找到合适的K，跳出循环, 否则换rule set重新采样
                     break
             else:
                 raise UserWarning('Cannot generate qualified corpus by all RuleSets')
         except UserWarning:
-            samples_file = os.path.splitext(os.path.split(samples_file_list[0])[1])[0]
-            self.__saveDb(samples_file, '无模型')  # 更新本模型对应的日志文件类型的数据库记录
+            self.__saveToDb('无模型')  # 更新本模型对应的日志文件类型的数据库记录
             raise
 
         self.model, self.percent, self.boundaries, self.quantiles = FileUtil.buildModel(self.__ClassName, k_, vectors)
         self.alias = ['rc' + str(i) for i in range(len(self.quantiles))]  # 簇的别名，默认为rci，可人工命名
 
-        self.__saveModel(samples_file_list[0])
-        self.__saveResult(samples_file_list[0], vectors)
+        self.__saveModel()
+        self.__saveResult(vectors)
 
     # 文档向量化。dataset-[document:M]-[[word]]-[[token]]-[BoW:M]-corpus-tfidf-dictionary:N, [vector:M*N]
     def __buildVectors(self, samples_file):
@@ -112,7 +125,10 @@ class RecordClassifier(object):
         for doc_idx, (document, lines) in enumerate(self.__buildDocument(samples_file)):
             dct.add_documents([document])
             self.tmp_cache_file.write(' '.join(document) + '\n')
-            if doc_idx % 500 == 0: G.log.debug('Processed %d records in %s', doc_idx, samples_file)
+            if doc_idx % 1000 == 0:
+                G.log.info('Processed %d records in %s', doc_idx, samples_file)
+            if doc_idx > 5000:  # 防止记录太多太慢
+                break
         if dct.num_docs < self.leastDocuments:  # 字典字数太少或文档数太少，没必要聚类
             self.tmp_cache_file.close()
             raise UserWarning('Too few records[%d]' % dct.num_docs)
@@ -207,35 +223,30 @@ class RecordClassifier(object):
         return to_
 
     # 保存模型和结果
-    def __saveModel(self, samples_file_fullname):
-        samples_file = os.path.splitext(os.path.split(samples_file_fullname)[1])[0]
+    def __saveModel(self):
+        samples_file = 'fc%d-%d' % (self.model_id, self.fc_id)
         joblib.dump((self.anchor, self.ruleSet, self.dictionary, self.model, self.alias, self.percent, self.boundaries,
-                     self.quantiles), os.path.join(G.projectModelPath, samples_file + '.mdl'))  # 保存模型，供后续使用
-        self.__saveDb(samples_file, '无指标')  # 更新本模型对应的日志文件类型的数据库记录
+                     self.quantiles), os.path.join(self.model_path, samples_file + '.mdl'))  # 保存模型，供后续使用
+        self.__saveToDb('无指标')  # 更新本模型对应的日志文件类型的数据库记录
 
         self.dictionary.save_as_text(os.path.join(G.logsPath, samples_file + '.dic.csv'))  # 保存文本字典，供人工审查
         df = DataFrame({'类型': self.alias, '样本占比': self.percent, '分位点距离': self.quantiles, '边界-分位点距离': self.boundaries})
         df.to_csv(os.path.join(G.logsPath, samples_file + '.mdl.csv'), sep='\t', encoding='utf-8')  # 保存聚类模型，供人工审查
-        G.log.info('Model saved to %s successful.', os.path.join(G.projectModelPath, samples_file + '.mdl'))
+        G.log.info('Model saved to %s successful.', os.path.join(self.model_path, samples_file + '.mdl'))
 
-    @staticmethod
-    def __saveDb(samples_file, status):
-        model_id = 1
-        fc_id = int(samples_file[2:])
+    def __saveToDb(self, status):
         with Dbc() as cursor:
-            sql = 'UPDATE file_class SET status="%s"  WHERE model_id=%d AND category_id=%d' % (status, model_id, fc_id)
+            sql = 'UPDATE file_class SET status="%s"  WHERE model_id=%d AND category_id=%d' % (
+            status, self.model_id, self.fc_id)
             cursor.execute(sql)
 
-    def __saveResult(self, samples_file_fullname, vectors):
+    def __saveResult(self, vectors):
         c_ids, confidences, distances = FileUtil.predict(self.model, self.boundaries, self.quantiles, vectors)
         c_names = [self.alias[label] for label in c_ids]
         self.tmp_cache_file.seek(0)
         records = [line for line in self.tmp_cache_file]
         df = DataFrame({'Category': c_names, 'Confidence': confidences, 'Record': records})
-        # df = DataFrame(columns=('Category', 'Confidence', 'Record'))
-        # for idx, (c_name, confidence, record) in enumerate(zip(c_names, confidences, self.tmp_cache_file)):
-        #     df.loc[idx] = c_name, confidence, record
-        samples_file = os.path.splitext(os.path.split(samples_file_fullname)[1])[0]
+        samples_file = 'fc%d-%d' % (self.model_id, self.fc_id)
         df.to_csv(os.path.join(G.logsPath, samples_file + '.out.csv'), sep='\t', encoding='utf-8')
         self.tmp_cache_file.close()
         G.log.info('Result saved to %s successful.', os.path.join(G.logsPath, samples_file + '.out.csv'))
@@ -307,16 +318,16 @@ class RecordClassifier(object):
     # 新的日志流连接建立后,如该日志流已有文件类型fc, 则被分发到本入口
     @classmethod
     def dispatcher(cls, flow_id, data_flow):
-        status, model_id, fc_id, rc_model = cls.__get_rc_model(flow_id)
+        status, model_id, fc_id, rc_model = cls.__getRcModel(flow_id)
 
         # 尚未形成记录模型
         if status == '无模型':
             status = cls.__cacheLogRecords(model_id, fc_id, flow_id, data_flow)
-
         # 缓存行数已经足够,本线程启动聚类
         if status == 'OK':
             prefix = 'fc%d' % fc_id
-            samples = sorted([os.path.join(G.l2_cache, f) for f in os.listdir(G.l2_cache) if f[:len(prefix)] == prefix])
+            samples = sorted([os.path.join(G.classifiedFilePath, f)
+                              for f in os.listdir(G.classifiedFilePath) if f[:len(prefix)] == prefix])
             try:
                 rc_model = RecordClassifier(samples)
                 status = '无指标'
@@ -326,15 +337,16 @@ class RecordClassifier(object):
         # 别的线程正在算记录模型, 等待其完成
         while status == '计算中':
             time.sleep(60)
-            status, model_id, fc_id, rc_model = cls.__get_rc_model(flow_id)
+            status, model_id, fc_id, rc_model = cls.__getRcModel(flow_id)
 
         if status in ['无指标', '无基线', '已完备']:
-            rc_model.process(data_flow)
+            if rc_model:
+                return
 
     # 把流数据缓存到文件中 ,并记录已经缓存的行数
     @classmethod
     def __cacheLogRecords(cls, model_id, fc_id, flow_id, data_flow):
-        file_fullname = os.path.join(G.l2_cache, 'fc%d-%d' % (fc_id, flow_id))
+        file_fullname = os.path.join(G.classifiedFilePath, 'fc%d-%d' % (fc_id, flow_id))
         received_lines, now = 0, time.time()
 
         with open(file_fullname, 'a', encoding='utf-8', errors='ignore') as fp:
@@ -367,34 +379,34 @@ class RecordClassifier(object):
         return status
 
     @staticmethod
-    def __get_rc_model(flow_id):
+    def __getRcModel(flow_id):
         with Dbc() as cursor:
             sql = 'SELECT f.model_id,f.category_id,f.status FROM tbl_log_flow AS t, file_class as f WHERE t.model_id=f.model_id AND t.category_id=f.category_id AND id = %d' % flow_id
             cursor.execute(sql)
-            result = cursor.fetchone()
-            model_id, fc_id, status = result
+            model_id, fc_id, status = cursor.fetchone()
 
         if status in ['无模型', '计算中']:
             rc_model = None
         else:
-            rc_model_file = os.path.join(G.modelPaths[model_id], 'fc%d.mdl' % fc_id)
+            rc_model_file = os.path.join(G.modelPath, str(model_id))
+            rc_model_file = os.path.join(rc_model_file, 'fc%d-%d.mdl' % (model_id, fc_id))
             rc_model = RecordClassifier(rc_model_file)
         return status, model_id, fc_id, rc_model
 
 
 
 if __name__ == '__main__':
-    RecordClassifier(model_or_sample='D:\\home\\suihf\\data\\l2cache\\fc97')
+    # RecordClassifier(model_or_sample='D:\\home\\suihf\\data\\l2cache\\fc97')
     errors = 0
     filename, index = '', 0
-    for index, filename in enumerate(os.listdir(G.l2_cache)):
+    for index, filename in enumerate(os.listdir(G.classifiedFilePath)):
         try:
-            filename = os.path.join(G.l2_cache, filename)
+            filename = os.path.join(G.classifiedFilePath, filename)
             if os.path.isfile(filename):
                 G.log.info('[%d]%s: Record classifying...', index, filename)
-                rc = RecordClassifier([filename])
+                # rc = RecordClassifier([filename])
         except Exception as err:
             errors += 1
             G.log.error('%s ignored due to: %s', filename, str(err))
             continue
-    G.log.info('%d model built and stored in %s, %d failed.', G.projectModelPath, index + 1 - errors, errors)
+    G.log.info('%d model built, %d failed.', index + 1 - errors, errors)

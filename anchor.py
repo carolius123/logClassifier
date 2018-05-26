@@ -214,7 +214,7 @@ class Anchor(object):
     def __probeDateOrder(unordered_dates, filename=''):
         date_value = np.max(unordered_dates, axis=0)
         date_len = unordered_dates.shape[1]
-        ymd_mask = np.array(['' for i in range(date_len)])
+        ymd_mask = np.array(['', '', ''])[:date_len]
 
         # 先拿最大的年月日数字的值碰碰运气
         this_year = int(time.strftime('%y'))

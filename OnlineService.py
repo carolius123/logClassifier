@@ -15,7 +15,7 @@ from FileClassifier import FileClassifier
 from RecordClassifier import RecordClassifier
 from anchor import Anchor
 from config import Workspaces as G
-from utilites import Dbc, FileUtil, DbUtil
+from utilites import Dbc, DbUtil
 
 
 # 实时接收日志流,
@@ -27,13 +27,7 @@ class OnlineService(object):
     def __init__(self):
         self.service_id = G.cfg.getint('OnlineService', 'ServiceID')
         self.threads = {}  # 保存日志流的source id 和 线程的id
-        self.models = []
-        for model_file in [G.productFileClassifierModel, G.projectFileClassifierModel]:
-            if os.path.exists(model_file):
-                model = FileClassifier(model_file)
-            else:
-                model = None
-            self.models.append(model)
+        self.models = FileClassifier.loadAllModels()
         threading.Thread(target=self.deamon).start()
 
     # Deamon for new flow
@@ -147,9 +141,9 @@ class OnlineService(object):
     def cacheLogFile(self, flow_id, flow_status, data_flow):
         filename = 'flow%d.log' % flow_id
         if flow_status == '未锚定':
-            path = G.inbox
+            path = G.transitPath
         else:
-            path = os.path.join(G.l0_inputs, os.path.splitext(filename)[0])
+            path = os.path.join(G.inboxPath, os.path.splitext(filename)[0])
         file_fullname = os.path.join(path, filename)
         now = time.time()
 
@@ -191,62 +185,37 @@ class OnlineService(object):
             return '无锚点'
 
         filename = os.path.split(inbox_file)[1]
-        path = os.path.join(G.l0_inputs, os.path.splitext(filename)[0])
+        path = os.path.join(G.inboxPath, os.path.splitext(filename)[0])
         os.makedirs(path, exist_ok=True)
         file_fullname = os.path.join(path, filename)
         shutil.copy(inbox_file, file_fullname)
 
-        path = path.replace(G.l0_inputs, G.l1_cache)
+        path = path.replace(G.inboxPath, G.mergedFilePath)
         os.makedirs(path, exist_ok=True)
         common_name = G.fileMergePattern.sub('', os.path.splitext(filename)[0])
         common_name = '%s-%s' % (anchor.name, common_name)
         common_file_fullname = os.path.join(path, common_name)
         shutil.move(inbox_file, common_file_fullname)
-
-        classified_files, unclassified_files = FileUtil.predictFiles(self.models, [common_file_fullname])
-        # classified_files [[model_id, common_name, category, category_name, confidence, distance]]
-        # unclassified_files [common_name]
-
         with Dbc() as cursor:
             file2merged = [[file_fullname, anchor.name, anchor.colSpan[0], anchor.colSpan[1], common_file_fullname]]
             DbUtil.dbUpdFilesSampled(cursor, file2merged)
-            DbUtil.dbUdFilesMerged(cursor, classified_files, unclassified_files)  # 更新数据库中合并文件表
 
-            anchor_info = '%s:%d:%d' % (anchor.name, anchor.colSpan[0], anchor.colSpan[1])
-            if len(classified_files):
-                status = '活动中'
-                model_id, _, category_id, category_name, _, _ = classified_files[0]
-                G.log.info('log flow[%d-%d] classified to [%d-%s]', self.service_id, flow_id, model_id, category_name)
-            else:
-                status = '未分类'
-                model_id, category_id = None, None
-                G.log.info('log flow[%d-%d] can not to be classified', self.service_id, flow_id)
-
+        file_fullnames = [common_file_fullname]
+        for model in self.models:
+            file_fullnames = model.predict(file_fullnames)
+        if file_fullnames:  # 剩下尚无法分类的
+            status = '未分类'
+            G.log.info('log flow[%d-%d] can not to be classified', self.service_id, flow_id)
             col_names = ['status', 'model_id', 'category_id', 'anchor']
-            col_values = [status, model_id, category_id, anchor_info]
+            col_values = [status, None, None, '%s:%d:%d' % (anchor.name, anchor.colSpan[0], anchor.colSpan[1])]
             DbUtil.dbUpdFlow(cursor, flow_id, col_names, col_values)
-
+        else:
+            status = '活动中'
+            G.log.info('log flow[%d-%d] classified', self.service_id, flow_id)
         return status
 
 
 if __name__ == '__main__':
-    # wildcard_log_files = [
-    #     ['192.168.1.1','d:\\app','flow1035.log',1,1,'COLON:1:12'],
-    #     ['192.168.1.2', 'd:\\app', 'flow12332343434.log', 1, 1, 'COLON:1:12'],
-    # ]
-    # with Dbc() as cursor:
-    #     DbUtil.dbInsertOrUpdateLogFlow(cursor, wildcard_log_files)
-
     ols = OnlineService()
-    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
-                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
-    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
-                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
-    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
-                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
-    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
-                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
-    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
-                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
-    ols.dispatcher('eeeee', open('D:\\home\\suihf\\data\\l2cache\\fc97', 'r', encoding='utf-8'), '10.20.23.170',
-                   '/home/elkuser/filebeat-5.5.0-linux-x86_64/logs', 'filebeat.?')
+
+    ols.dispatcher('abd', open('D:\\home\\suihf\\data\\fc1-46', 'r', encoding='utf-8'))

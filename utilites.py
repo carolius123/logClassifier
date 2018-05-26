@@ -42,6 +42,22 @@ class FileUtil(object):
     """
     
     """
+
+    @staticmethod
+    def moveFiles(from_, to_, counter):
+        for sub_path_from, dir_names, file_names in os.walk(from_):
+            sub_path_to = sub_path_from.replace(from_, to_)
+            os.makedirs(sub_path_to, exist_ok=True)
+            for file_name in file_names:
+                try:
+                    shutil.move(os.path.join(sub_path_from, file_name), os.path.join(sub_path_to, file_name))
+                    counter['Success'] += 1
+                except Exception as err:
+                    G.log.info('File move err %s', str(err))
+                    counter['Failed'] += 1
+                    continue
+
+
     # 解压文件
     @staticmethod
     def extractFile(tar_file, to_):
@@ -67,7 +83,7 @@ class FileUtil(object):
 
         with Dbc() as cursor:
             DbUtil.dbUpdFilesSampled(cursor, file2merged)
-            DbUtil.dbInsert(cursor, 'files_sampled', ['file_fullname', 'anchor_name', 'notes'], failed_to_merge)
+            DbUtil.dbInsert(cursor, 'files_sampled:file_fullname, anchor_name, notes', failed_to_merge)
         G.log.info('Merged %d files from %s into %s', processed[0], from_, to_)
 
         return merged_files, file2merged
@@ -265,25 +281,6 @@ class FileUtil(object):
         return kmeans, percents, boundaries, quantiles
 
     @staticmethod
-    def predictFiles(models, merged_files):
-        classified_files, unclassified_files = [], []
-        for common_name in merged_files:
-            for model in models:
-                if model:  # 模型存在
-                    result = model.predictFile(common_name)
-                    if not result:
-                        continue
-                    category, category_name, confidence, distance = result
-                    if confidence < G.minFileConfidence:  # 置信度不够,未完成分类
-                        continue
-                    classified_files.append(
-                        [model.model_id, common_name, category, category_name, confidence, distance])
-                    break
-            else:
-                unclassified_files.append(common_name)
-        return classified_files, unclassified_files
-
-    @staticmethod
     def predict(kmeans, c_boundaries, c_quantiles, vectors):
         norm_factor = - vectors.shape[1]  # 按字典宽度归一化
 
@@ -303,17 +300,17 @@ class FileUtil(object):
 
     # 同类文件合并到to_目录下，供后续记录聚类使用
     @staticmethod
-    def mergeFilesByClass(cursor, to_):
+    def mergeFilesByClass(model_id, list_from, path_to):
         c = [0, 0, 0]  # counter
-        sql = 'SELECT model_id+category_id*10,category_name, file_fullname FROM files_classified WHERE confidence >= %f ORDER BY model_id, category_id, last_collect, last_update' % G.minFileConfidence
-        cursor.execute(sql)
-        results = cursor.fetchall()
         prev_id = -1
         file_to, fp_to = None, None
-        for next_id, category_name, file_fullname in results:
+        result_files = []
+        for next_id, file_fullname in list_from:
             if next_id != prev_id:
-                fp_to.close() if fp_to else None
-                file_to = os.path.join(to_, category_name)  # 以类别名称作为输出文件名称
+                if fp_to:
+                    fp_to.close()
+                    result_files.append(file_to)
+                file_to = os.path.join(path_to, 'fc%d-%d' % (model_id, next_id))  # 文件命名规则后续逻辑使用
                 fp_to = open(file_to, 'wb')
                 prev_id = next_id
                 c[2] += 1
@@ -329,60 +326,11 @@ class FileUtil(object):
                 continue
 
         fp_to.close()
-        G.log.info('%d files(%d errors) merged into %d sample files, stored into %s', c[0], c[1], c[2], to_)
-
-    # 识别切分日志, 形成应采文件的列表.
-    @staticmethod
-    def genGatherList(cursor, additional_where=''):
-        """
-        切分日志包括定时归档、定长循环、定时新建3种情况，定时归档日志只需采集最新文件，定长循环、定时新建日志当作1个
-        数据流处理, 采集日期最新的,如一段时间未更新, 则试图切换到更新的采集.
-        """
-        prev_id, wildcard_log_files = '', []
-        files_by_class_and_path, common_name_set = [], set()
-        results = FileUtil.__querySamples(cursor, additional_where)
-        for row in results:
-            model_id, category_id, host, remote_path, filename, common_name, anchor_name, anchor_start_col, anchor_end_col, last_collect, last_update = row
-            next_id = '%d-%d-%s-%s' % (model_id, category_id, host, remote_path)
-            seconds_ago = (last_collect - last_update).total_seconds()
-            anchor = '%s:%d:%d' % (anchor_name, anchor_start_col, anchor_end_col)
-            common_name = os.path.split(common_name)[1]
-            files_by_class_and_path.append([filename, common_name, seconds_ago, anchor])
-            common_name_set.add(common_name)
-            if prev_id == '':
-                prev_id = next_id
-            if prev_id == next_id:
-                continue
-
-            cp_groups = FileUtil.__splitSamples(files_by_class_and_path, common_name_set)
-            FileUtil.__getWildcard_files(cp_groups, prev_id, wildcard_log_files)
-
-            prev_id = next_id
-            files_by_class_and_path, common_name_set = [], set()
-
-        return wildcard_log_files
+        G.log.info('%d files(%d errors) merged into %d sample files, stored into %s', c[0], c[1], c[2], path_to)
+        return result_files
 
     @staticmethod
-    def __querySamples(cursor, additional_where):
-        sql = 'SELECT model_id,category_id, host, remote_path, filename, common_name,anchor_name, anchor_start_col, anchor_end_col,last_collect,last_update FROM files_classified WHERE confidence >= %f %s ORDER BY model_id, category_id, host, remote_path' % (
-            G.minFileConfidence, additional_where)
-        cursor.execute(sql)
-        return cursor.fetchall()
-
-    @staticmethod
-    def __splitSamples(files_by_class_and_path, common_name_set):
-        num_common_names = len(common_name_set)
-        differences = [len(G.fileCheckPattern.findall(name)) for name, _, _, _ in files_by_class_and_path]
-        special_files = differences.count(min(differences))  # 不是通常归档文件的文件数量
-        if num_common_names == 2 and special_files > 1 or num_common_names > 2:  # 同目录下多组日志文件, 进一步拆分
-            common_name_groups = FileUtil.__groupCommonName(common_name_set)
-            cp_groups = FileUtil.__splitFurther(common_name_groups, files_by_class_and_path)
-        else:
-            cp_groups = {0: files_by_class_and_path}
-        return cp_groups
-
-    @staticmethod
-    def __groupCommonName(common_name_set):
+    def groupCommonName(common_name_set):
         common_names = list(common_name_set)
         common_names_group = []
         processed = []
@@ -402,67 +350,6 @@ class FileUtil(object):
                 common_names_group.append([prev_])
         return common_names_group
 
-    @staticmethod
-    def __splitFurther(common_name_groups, files_by_class_and_path):
-        cp_groups = {}
-        for filename, common_name, seconds_ago, anchor in files_by_class_and_path:
-            for idx, common_name_group in enumerate(common_name_groups):
-                if common_name in common_name_group:
-                    break
-
-            v_ = cp_groups.get(idx, [])
-            v_.append([filename, common_name, seconds_ago, anchor])
-            cp_groups[idx] = v_
-        return cp_groups
-
-    @staticmethod
-    def __getWildcard_files(cp_groups, prev_id, wildcard_log_files):
-        for cp_group in cp_groups.values():
-            cp_group.sort(key=lambda x: '%fA%s' % (x[2], x[0]))
-            filename, common_name, seconds_ago, anchor = cp_group[0]
-            if seconds_ago > G.last_update_seconds:  # 最新的文件长期未更新,不用采
-                continue
-            # 取hostname
-            model_id, category_id, host, remote_path = prev_id.split('-', maxsplit=3)
-            if len(cp_group) == 1:  # 仅有一个有效文件
-                wildcard_log_files.append([host, remote_path, filename, model_id, category_id, anchor])
-                continue
-
-            differences = [len(name) for name, _, _, _ in cp_group]  # 文件名不同部分的长度
-            min_len, max_len = min(differences), max(differences)
-            min_files = differences.count(min_len)
-            if min_files == len(differences):  # 定时新建(所有文件名同样长): 通配符采集
-                filename = G.fileCheckPattern.sub('?', filename)
-            elif max_len - min_len < 3:  # 定长归档(长度差不超过2).共同前缀作为通配符
-                filename = FileUtil.__getFixedSizeLogFilePrefix(cp_group)
-            else:  # 其他情况为定期归档, 采集最新的特别文件
-                pass
-
-            wildcard_log_files.append([host, remote_path, filename, model_id, category_id, anchor])
-
-    # 计算字符串数组的公共前缀
-    @staticmethod
-    def __getFixedSizeLogFilePrefix(cp_group):
-        cp_group.sort(key=lambda x: len(x[0]))
-        shortest, compared = cp_group[0][0], cp_group[1][0]
-        i = 0
-        for i in range(len(shortest), 0, -1):
-            if shortest[:i] == compared[:i]:
-                break
-        return shortest[:i] + '*'
-
-    @staticmethod
-    def splitResults(model_id, min_confidence, results):
-        classified_files, unclassified_files = [], []
-        for common_name, category, category_name, confidence, distance in zip(results[0], results[1], results[2],
-                                                                              results[3], results[4]):
-            if confidence < min_confidence:  # 置信度不够,未完成分类
-                unclassified_files.append(common_name)
-            else:
-                classified_files.append([model_id, common_name, category, category_name, confidence, distance])
-        return classified_files, unclassified_files
-
-
 class DbUtil(object):
     # 连接数据库
     @classmethod
@@ -479,17 +366,19 @@ class DbUtil(object):
             return None
 
     @staticmethod
-    def dbInsert(cursor, table_name, col_names, dataset, update=True):
+    def dbInsert(cursor, header, dataset, update=True):
         if not (cursor and len(dataset)):  # 无游标或者无数据
             return
+        table_name, col_names = header.split(':')
+        col_name_list = [col_name.strip() for col_name in col_names.split(',')]
 
-        sql_head = 'INSERT INTO %s (%s) VALUES(' % (table_name, ','.join(col_names))
+        sql_head = 'INSERT INTO %s (%s) VALUES(' % (table_name, col_names)
         sql_tail = ') ON DUPLICATE KEY UPDATE '
 
         for row in dataset:
             insert_data = ''
             update_data = ''
-            for col_name, cell_data in zip(col_names, row):
+            for col_name, cell_data in zip(col_name_list, row):
                 str_data = 'null,' if cell_data is None else '"%s",' % str(cell_data)
                 str_data = str_data.replace('\\', '\\\\')
                 insert_data += str_data
@@ -503,23 +392,8 @@ class DbUtil(object):
                 try:
                     cursor.execute(sql)
                 except Exception as err:
-                    G.log.warning('Error in dbInsert %s', str(err))
+                    G.log.debug('Error in dbInsert %s', str(err))
                     continue
-
-    #  插入或更新合并文件分类表
-    @staticmethod
-    def dbUdFilesMerged(cursor, classified_files, unclassified_files):
-        for common_name in unclassified_files:
-            common_name = '"%s"' % common_name.replace('\\', '/')
-            sql = 'INSERT INTO files_merged (common_name) VALUES(%s) ON DUPLICATE KEY UPDATE model_id=NULL , category_id=NULL , confidence=NULL , distance=NULL ' % (
-                common_name)
-            cursor.execute(sql)
-
-        for model_id, common_name, category, category_name, confidence, distance in classified_files:
-            common_name = '"%s"' % common_name.replace('\\', '/')
-            sql = 'INSERT INTO files_merged (common_name, model_id, category_id, confidence, distance) VALUES(%s, %d, %d, %f, %e) ON DUPLICATE KEY UPDATE model_id=%d , category_id=%d , confidence=%f , distance=%e' % (
-                common_name, model_id, category, confidence, distance, model_id, category, confidence, distance)
-            cursor.execute(sql)
 
     @staticmethod
     def dbInsertOrUpdateLogFlow(cursor, wildcard_log_files):
@@ -535,8 +409,8 @@ class DbUtil(object):
                 flow_id = int(match_.group(1))
                 cursor.execute('SELECT COUNT(id) from tbl_log_flow where id=%d' % flow_id)
                 if cursor.fetchall()[0][0]:
-                    sql = 'UPDATE tbl_log_flow SET host=%s, path=%s, wildcard_name=%s, model_id=%s, category_id=%s, anchor=%s WHERE id=%d' % (
-                        host, remote_path, filename, model_id, category_id, anchor, flow_id)
+                    sql = 'UPDATE tbl_log_flow SET host=%s, path=%s, wildcard_name=%s, model_id=%s, category_id=%s, anchor=%s, status="活动中" WHERE id=%d' % (
+                    host, remote_path, filename, model_id, category_id, anchor, flow_id)
                     cursor.execute(sql)
                     continue
 
@@ -551,7 +425,7 @@ class DbUtil(object):
         dataset1 = []
         for file_fullname, anchor_name, anchor_start, anchor_end, common_file_fullname in file2merged:
             file_fullname = file_fullname.replace('\\', '/')
-            host = file_fullname[len(G.l0_inputs):].strip('/')
+            host = file_fullname[len(G.inboxPath):].strip('/')
             host, filename = host.split('/', 1)
             archive_path, filename = os.path.split(filename)
             remote_path = ''
@@ -561,11 +435,11 @@ class DbUtil(object):
             dataset.append([file_fullname, host, archive_path, filename, remote_path, 'reverse engineering'])
             dataset1.append([file_fullname, anchor_name, anchor_start, anchor_end, common_file_fullname])
 
-        col_names = ['file_fullname', 'host', 'archive_path', 'filename', 'remote_path', 'notes']
-        DbUtil.dbInsert(cursor, 'files_sampled', col_names, dataset, update=False)
+        DbUtil.dbInsert(cursor, 'files_sampled:file_fullname, host, archive_path, filename, remote_path, notes',
+                        dataset, update=False)
 
-        col_names = ['file_fullname', 'anchor_name', 'anchor_start_col', 'anchor_end_col', 'common_name']
-        DbUtil.dbInsert(cursor, 'files_sampled', col_names, dataset1)
+        DbUtil.dbInsert(cursor, 'files_sampled:file_fullname,anchor_name,anchor_start_col,anchor_end_col,common_name',
+                        dataset1)
 
     @staticmethod
     def dbUpdFlow(cursor, flow_id, col_names, data):
