@@ -208,7 +208,8 @@ class OnlineService(object):
             G.log.info('log flow[%d-%d] can not to be classified', self.service_id, flow_id)
             col_names = ['status', 'model_id', 'category_id', 'anchor']
             col_values = [status, None, None, '%s:%d:%d' % (anchor.name, anchor.colSpan[0], anchor.colSpan[1])]
-            DbUtil.dbUpdFlow(cursor, flow_id, col_names, col_values)
+            with Dbc() as cursor:
+                DbUtil.dbUpdFlow(cursor, flow_id, col_names, col_values)
         else:
             status = '活动中'
             G.log.info('log flow[%d-%d] classified', self.service_id, flow_id)
@@ -218,4 +219,4 @@ class OnlineService(object):
 if __name__ == '__main__':
     ols = OnlineService()
 
-    ols.dispatcher('abd', open('D:\\home\\suihf\\data\\fc1-46', 'r', encoding='utf-8'))
+    # ols.dispatcher('abd', open('D:\\home\\suihf\\data\\fc0-4', 'r', encoding='utf-8'))

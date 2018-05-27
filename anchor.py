@@ -165,11 +165,11 @@ class Anchor(object):
         except Exception as err:
             G.log.warning('%s ignored due to the following error:%s', sample_file, str(err))
 
-    # 找带分隔符的日期
+    # 找带分隔符的日期, 兼容如下例子<Apr 8, 2017 8:51:28 AM CST>, [2017-12-31T15:32:30.255+08:00]
     def __probeHyphenDate(self, time_span, line, results, left):
         base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
-        line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex), line)
-        line = re.sub(r'[年月日]', '-', line)
+        line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex) + ',', line)
+        line = re.sub(r'[年月日]|, ', '-', line)
 
         start_col = base_col + time_span[0] - G.dateMargin
         start_col = 0 if start_col < 0 else start_col
@@ -191,7 +191,7 @@ class Anchor(object):
 
     def __setDatePattern(self, results, left):
         if not results:  # 没有搜到日期数据
-            self.datePattern['name'] = None
+            self.datePattern = None
             return
 
         unordered_dates = np.array([[int(cell) for cell in row.split('/')] for row in list(results)])
@@ -317,8 +317,8 @@ class Anchor(object):
     # 在时间左侧或者右侧搜索并提取以/\-等分隔的日期
     def __getHyphenDate(self, time_span, line):
         base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
-        line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex), line)
-        line = re.sub(r'[年月日]', '-', line)
+        line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex) + ',', line)
+        line = re.sub(r'[年月日]|, ', '-', line)
 
         start_col = base_col + time_span[0] - G.dateMargin if self.datePattern['left'] else base_col + time_span[1]
         start_col = 0 if start_col < 0 else start_col
@@ -385,9 +385,8 @@ class Anchor(object):
         elif not century:  # YYMMDD格式
             yy = 2000 + int(yy)
         else:  # YYYYMMDD格式
-            yy = int(century) * 100 + yy
-        anchor_date = datetime.date(yy, mm, dd)
-        return anchor_date
+            yy = int(century) * 100 + int(yy)
+        return datetime.date(yy, mm, dd)
 
 
 if __name__ == '__main__':
@@ -395,7 +394,7 @@ if __name__ == '__main__':
 
 
     def run():
-        file_or_path = 'D:\\home\\t.txt'
+        file_or_path = 'D:\\home\\suihf\\data\\classified\\fc0-67'
         #            input('input a path or full file name:')
         if not file_or_path.strip():
             return False

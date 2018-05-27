@@ -115,6 +115,7 @@ class BatchJobService(object):
         try:
             FileClassifier(model_id, G.mergedFilePath)
         except UserWarning:
+            G.log.warning('ddd')
             pass
         self.models = FileClassifier.loadAllModels()
 
@@ -139,5 +140,5 @@ class BatchJobService(object):
 
 if __name__ == '__main__':
     bcs = BatchJobService()
-    bcs.buildModel(re_merge=True)
-    # bcs.run()
+    # bcs.buildModel()
+    bcs.run()

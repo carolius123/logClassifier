@@ -6,8 +6,10 @@
 # @Desc  : 
 #
 
+from utilites import Dbc
 
-# 
+
+#
 class IndicatorModel(object):
     """
     
@@ -18,4 +20,13 @@ class IndicatorModel(object):
 
 
 if __name__ == '__main__':
+    with Dbc() as c1:
+        c1.execute('SELECT * FROM kpi')
+        result = c1.fetchall()
+        print(result)
+        with Dbc() as c2:
+            c2.execute('INSERT INTO record_class(model_id, fc_id,rc_id) VALUES (1,2,3)')
+            result = c2.fetchall()
+            print(result)
+
     IndicatorModel()

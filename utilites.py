@@ -259,31 +259,43 @@ class FileUtil(object):
 
     # 重新聚类，得到各Cluster的中心点、分位点距离、边界距离以及数量占比等
     @staticmethod
-    def buildModel(classifier_section_name, k_, vectors):
-        # 再次聚类并对结果分组。 Kmeans不支持余弦距离
-        kmeans = KMeans(n_clusters=k_, n_init=20, max_iter=500).fit(vectors)
+    def buildModel(cfg_section, k_, vectors):
         norm_factor = - vectors.shape[1]  # 按字典宽度归一化
-        groups = pd.DataFrame({'C': kmeans.labels_, 'S': [kmeans.score([v]) / norm_factor for v in vectors]}).groupby(
-            'C')
-        percents = groups.size() / len(vectors)  # 该簇向量数在聚类总向量数中的占比
-        cfg_q = G.cfg.getfloat(classifier_section_name, 'Quantile')
-        quantiles = np.array([groups.get_group(i)['S'].quantile(cfg_q, interpolation='higher') for i in range(k_)])
+        kmeans = KMeans(n_clusters=k_, n_init=20, max_iter=500).fit(vectors)
+        scores = np.array([kmeans.score([v]) / norm_factor for v in vectors])
+        groups = pd.DataFrame({'C': kmeans.labels_, 'S': scores}).groupby('C')
+        # 计算结果各类的0.8分位点和边界距离
+        quantile = G.cfg.getfloat(cfg_section, 'Quantile')
+        quantiles = np.array([groups.get_group(i)['S'].quantile(quantile, interpolation='higher') for i in range(k_)])
         boundaries = groups['S'].agg('max').values  # 该簇中最远点距离
-
-        quantiles2 = quantiles * 2
-        boundaries[boundaries > quantiles2] = quantiles2[boundaries > quantiles2]  # 边界太远的话，修正一下
-        boundaries[boundaries < 1e-100] = 1e-100  # 边界为零的话，修正一下
+        double_quantiles = quantiles * 2
+        boundaries[boundaries > double_quantiles] = double_quantiles[boundaries > double_quantiles]  # 边界太远的话，修正一下
         quantiles = boundaries - quantiles
-        quantiles[quantiles < 1e-100] = 1e-100  # 避免出现0/0
+        # 计算结果各类的向量数量和坏点数量(离中心太远)
+        total_points = groups.size()
+        min_distances = boundaries - quantiles * G.cfg.getfloat(cfg_section, 'MinConfidence')
+        bad_points = []
+        for label, group_ in groups:
+            distances = np.array(group_['S'])
+            distances[distances < min_distances[label]] = 1
+            distances[distances >= min_distances[label]] = 0
+            bad_points.append(np.sum(distances))
+        c_ids = [i for i in range(k_)]
+        categories = np.vstack((c_ids, boundaries, quantiles, total_points, bad_points)).transpose()
 
         G.log.info('Model(k=%d) built. inertia=%e， max proportion=%.2f%%, max quantiles=%e, max border=%e',
-                   k_, kmeans.inertia_, max(percents) * 100, max(quantiles), max(boundaries))
-        return kmeans, percents, boundaries, quantiles
+                   k_, kmeans.inertia_, max(total_points) / len(vectors) * 100, max(quantiles), max(boundaries))
+        return kmeans, categories
 
     @staticmethod
-    def predict(kmeans, c_boundaries, c_quantiles, vectors):
+    def predict(kmeans, model_quantiles, vectors):
+        """
+        :param kmeans: k-means model
+        :param model_quantiles: k*2 array of [distance from border to center, and distance from border to quantile]
+        :param vectors:
+        :return: samples * 3 array of [label, confidence, distance to center]
+        """
         norm_factor = - vectors.shape[1]  # 按字典宽度归一化
-
         predicted_labels = kmeans.predict(vectors)  # 使用聚类模型预测记录的类别
         confidences = []
         distances = []
@@ -291,7 +303,14 @@ class FileUtil(object):
             distance = kmeans.score([v]) / norm_factor
             distances.append(distance)
             category = predicted_labels[i]
-            confidences.append((c_boundaries[category] - distance) / c_quantiles[category])
+            confidence = model_quantiles[category, 0] - distance
+            if model_quantiles[category, 1]:
+                confidence /= model_quantiles[category, 1]
+            else:
+                confidence /= 1e-100
+                if confidence >= 0:
+                    confidence += 1
+            confidences.append(confidence)
         confidences = np.array(confidences, copy=False)
         confidences[confidences > 99.9] = 99.9
         confidences[confidences < -99.9] = -99.9

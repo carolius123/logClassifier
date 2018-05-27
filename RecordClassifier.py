@@ -44,22 +44,18 @@ class RecordClassifier(object):
     __Quantile = G.cfg.getfloat(__ClassName, 'Quantile')  # 类别的边界，该类中以该值为分位数的点，作为该类的边界
 
     def __init__(self, model_or_sample):
+        self.anchor = None  # 时间戳锚点Anchor
         self.ruleSet = None  # 处理文件正则表达式
         self.dictionary = None  # 字典Dictionary
         self.model = None  # 聚类模型 KMeans
-        self.alias = None  # cluster名称
-        self.percent = None  # 该类别数量占比
-        self.boundaries = None  # 最远点到(0.8)分位点距离平方
-        self.quantiles = None  # (0.8)分位点到中心点距离平方
-        self.anchor = None  # 时间戳锚点Anchor
+        self.categories = None
 
         if type(model_or_sample) is str:
             if not os.path.exists(model_or_sample):
                 G.log.warning('[err]File not found. No model loaded!')
                 return
             try:  # 从模型文件装载模型
-                self.anchor, self.ruleSet, self.dictionary, self.model, self.alias, self.percent, self.boundaries, self.quantiles = joblib.load(
-                    model_or_sample)
+                self.anchor, self.ruleSet, self.dictionary, self.model, self.categories = joblib.load(model_or_sample)
                 match_ = re.match(r'fc(\d+)-(\d+)', os.path.split(model_or_sample)[1])
                 if not match_:
                     raise UserWarning('Filename format err')
@@ -111,9 +107,7 @@ class RecordClassifier(object):
             self.__saveToDb('无模型')  # 更新本模型对应的日志文件类型的数据库记录
             raise
 
-        self.model, self.percent, self.boundaries, self.quantiles = FileUtil.buildModel(self.__ClassName, k_, vectors)
-        self.alias = ['rc' + str(i) for i in range(len(self.quantiles))]  # 簇的别名，默认为rci，可人工命名
-
+        self.model, self.categories = FileUtil.buildModel(self.__ClassName, k_, vectors)
         self.__saveModel()
         self.__saveResult(vectors)
 
@@ -196,19 +190,12 @@ class RecordClassifier(object):
         norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度标准化因子，保证不同向量的可比性
         termination_inertia = G.cfg.getfloat(classifier_section_name, 'NormalizedTerminationInertia') * norm_factor
 
-        k_ = G.cfg.getint(classifier_section_name, 'MaxCategory')
+        k_ = min(G.cfg.getint(classifier_section_name, 'MaxCategory'), vectors.shape[0])
 
         kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
         G.log.info('pilot clustering. (k,inertia)=\t%d\t%e', k_, kmeans.inertia_)
         if kmeans.inertia_ > termination_inertia:
             return k_
-
-        # while k_ < len(vectors):
-        #     kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
-        #     G.log.info('pilot clustering. (k,inertia)=\t%d\t%e', k_, kmeans.inertia_)
-        #     if kmeans.inertia_ < termination_inertia:
-        #         break
-        #     k_ *= 2
 
         to_ = k_
         while to_ - from_ > 1:
@@ -225,12 +212,13 @@ class RecordClassifier(object):
     # 保存模型和结果
     def __saveModel(self):
         samples_file = 'fc%d-%d' % (self.model_id, self.fc_id)
-        joblib.dump((self.anchor, self.ruleSet, self.dictionary, self.model, self.alias, self.percent, self.boundaries,
-                     self.quantiles), os.path.join(self.model_path, samples_file + '.mdl'))  # 保存模型，供后续使用
+        joblib.dump((self.anchor, self.ruleSet, self.dictionary, self.model, self.categories),
+                    os.path.join(self.model_path, samples_file + '.mdl'))  # 保存模型，供后续使用
         self.__saveToDb('无指标')  # 更新本模型对应的日志文件类型的数据库记录
 
         self.dictionary.save_as_text(os.path.join(G.logsPath, samples_file + '.dic.csv'))  # 保存文本字典，供人工审查
-        df = DataFrame({'类型': self.alias, '样本占比': self.percent, '分位点距离': self.quantiles, '边界-分位点距离': self.boundaries})
+        df = DataFrame({'类型': self.categories[:, 0], '样本数': self.categories[:, 3], '坏点数': self.categories[:, 4],
+                        '边界': self.categories[:, 1], '分位点-边界': self.categories[:, 2]})
         df.to_csv(os.path.join(G.logsPath, samples_file + '.mdl.csv'), sep='\t', encoding='utf-8')  # 保存聚类模型，供人工审查
         G.log.info('Model saved to %s successful.', os.path.join(self.model_path, samples_file + '.mdl'))
 
@@ -241,11 +229,10 @@ class RecordClassifier(object):
             cursor.execute(sql)
 
     def __saveResult(self, vectors):
-        c_ids, confidences, distances = FileUtil.predict(self.model, self.boundaries, self.quantiles, vectors)
-        c_names = [self.alias[label] for label in c_ids]
+        c_ids, confidences, distances = FileUtil.predict(self.model, self.categories[:, 1:3], vectors)
         self.tmp_cache_file.seek(0)
         records = [line for line in self.tmp_cache_file]
-        df = DataFrame({'Category': c_names, 'Confidence': confidences, 'Record': records})
+        df = DataFrame({'Category': c_ids, 'Confidence': confidences, 'Record': records})
         samples_file = 'fc%d-%d' % (self.model_id, self.fc_id)
         df.to_csv(os.path.join(G.logsPath, samples_file + '.out.csv'), sep='\t', encoding='utf-8')
         self.tmp_cache_file.close()
@@ -280,15 +267,10 @@ class RecordClassifier(object):
                         record += next_line
                     continue
 
-                words = FileUtil.getWords(record, rule_set=self.ruleSet)
-                vectors = self.__buildVector([words])  # 计算向量[vector:Record*dictionary]
-                c_ids, confidences, distances = FileUtil.predict(self.model, self.boundaries, self.quantiles, vectors)
-                c_id, confidence, distance = c_ids[0], confidences[0], distances[0]
-                c_name = self.alias[c_id]
-
+                c_ids, confidences, distances = self.__predict(record)
                 timestamp = next_timestamp  # 保存下一个时间戳
                 record = next_line  # 当前行存入当前记录，准备下次循环
-                yield timestamp, c_ids, c_name, confidences, distances, record, words
+                yield timestamp, c_ids, confidences, distances, record
             except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
                 G.log.exception('Record [%s] ignored due to the following error:', record)
                 record = ''  # 清空并丢弃现有记录
@@ -296,12 +278,8 @@ class RecordClassifier(object):
         # 处理最后一行
         if record != '':
             try:
-                words = FileUtil.getWords(record, rule_set=self.ruleSet)
-                vectors = self.__buildVector([words])  # 计算向量[vector:Record*dictionary]
-                c_ids, confidences, distances = FileUtil.predict(self.model, self.boundaries, self.quantiles, vectors)
-                c_id, confidence, distance = c_ids[0], confidences[0], distances[0]
-                c_name = self.alias[c_id]
-                yield timestamp, c_ids, c_name, confidences, distances, record, words
+                c_ids, confidences, distances = self.__predict(record)
+                yield timestamp, c_ids, confidences, distances, record
             except (UnicodeError, UnicodeDecodeError, UnicodeEncodeError):
                 G.log.exception('Record [%s] ignored due to the following error:', record)
         raise StopIteration
@@ -314,6 +292,13 @@ class RecordClassifier(object):
             for (word_idx, tf_idf_value) in tfidf_model[self.dictionary.doc2bow(document)]:  # [(id,tf-idf)...], id是升序
                 vectors[doc_idx, word_idx] = tf_idf_value
         return vectors
+
+    #
+    def __predict(self, record):
+        words = FileUtil.getWords(record, rule_set=self.ruleSet)
+        vectors = self.__buildVector([words])  # 计算向量[vector:Record*dictionary]
+        c_ids, confidences, distances = FileUtil.predict(self.model, self.categories[:, 1:3], vectors)
+        return c_ids, confidences, distances
 
     # 新的日志流连接建立后,如该日志流已有文件类型fc, 则被分发到本入口
     @classmethod
@@ -396,17 +381,17 @@ class RecordClassifier(object):
 
 
 if __name__ == '__main__':
-    # RecordClassifier(model_or_sample='D:\\home\\suihf\\data\\l2cache\\fc97')
-    errors = 0
-    filename, index = '', 0
-    for index, filename in enumerate(os.listdir(G.classifiedFilePath)):
-        try:
-            filename = os.path.join(G.classifiedFilePath, filename)
-            if os.path.isfile(filename):
-                G.log.info('[%d]%s: Record classifying...', index, filename)
-                # rc = RecordClassifier([filename])
-        except Exception as err:
-            errors += 1
-            G.log.error('%s ignored due to: %s', filename, str(err))
-            continue
-    G.log.info('%d model built, %d failed.', index + 1 - errors, errors)
+    RecordClassifier(['D:\\home\\suihf\\data\\classified\\fc0-23'])
+    # errors = 0
+    # filename, index = '', 0
+    # for index, filename in enumerate(os.listdir(G.classifiedFilePath)):
+    #     try:
+    #         filename = os.path.join(G.classifiedFilePath, filename)
+    #         if os.path.isfile(filename):
+    #             G.log.info('[%d]%s: Record classifying...', index, filename)
+    #             rc = RecordClassifier([filename])
+    # except Exception as err:
+    #     errors += 1
+    #     G.log.error('%s ignored due to: %s', filename, str(err))
+    #     continue
+    # G.log.info('%d model built, %d failed.', index + 1 - errors, errors)

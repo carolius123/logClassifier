@@ -60,10 +60,9 @@ class FileClassifier(object):
     def __dbRebuildCategories(self):
         with Dbc() as cursor:
             cursor.execute('DELETE FROM file_class WHERE model_id=%d' % self.model_id)
-            dataset = [[self.model_id, c_id, 'fc%d' % c_id, percent, boundary, quantile] for
-                       c_id, (percent, boundary, quantile) in
-                       enumerate(zip(self.categories[0], self.categories[1], self.categories[2]))]
-            header = 'file_class:model_id, category_id, name, quantile, boundary, percent'
+            header = 'file_class:model_id, name, category_id, boundary, quantile, total_docs, bad_docs'
+            names = [[self.model_id, 'fc%d' % c_id] for c_id in self.categories[:, 0]]
+            dataset = np.hstack((names, self.categories))
             DbUtil.dbInsert(cursor, header, dataset, update=False)
 
     # 训练、生成模型并保存在$model/xxx.mdl中,dataset:绝对/相对路径样本文件名，或者可迭代样本字符流
@@ -97,8 +96,7 @@ class FileClassifier(object):
             raise
 
         # 重新聚类, 得到模型(向量数、中心点和距离）和分类(向量-所属类)
-        self.model, percents, boundaries, quantiles = FileUtil.buildModel(self.__ClassName, k_, vectors)
-        self.categories = [percents, boundaries, quantiles]
+        self.model, self.categories = FileUtil.buildModel(self.__ClassName, k_, vectors)
         # 保存模型文件和数据库
         self.__saveModel()  # model saved to file
         self.__postProcess(vectors)
@@ -154,8 +152,6 @@ class FileClassifier(object):
         processed_files = os.path.join(self.model_path, 'buildDocument.dbf')
         processed = [] if not os.path.exists(processed_files) else joblib.load(processed_files)
         with Dbc() as cursor:
-            # cursor = db.cursor() if db else None
-            #
             for dir_path, dir_names, file_names in os.walk(dataset_path):
                 for file_name in file_names:
                     try:
@@ -175,8 +171,6 @@ class FileClassifier(object):
                         G.log.warning('Failed to convert\t%s, ignored.\t%s', file_fullname, str(err))
                         continue
         joblib.dump(processed, processed_files)
-        # cursor.close()
-        # db.close()
         G.log.info('Converted %d files,%d failed', amount_files, failed_files)
         raise StopIteration()
 
@@ -257,7 +251,7 @@ class FileClassifier(object):
         G.log.info('Model is built and saved to %s successful.', model_file)
 
     def __postProcess(self, vectors):
-        results = FileUtil.predict(self.model, self.categories[1], self.categories[2], vectors)
+        results = FileUtil.predict(self.model, self.categories[:, 1:3], vectors)
         with Dbc() as cursor:
             self.__dbUdFilesMerged(cursor, self.common_filenames, results)
             self.__updLogFlows(cursor)  # 生成采集文件列表
@@ -268,7 +262,7 @@ class FileClassifier(object):
             from_list = cursor.fetchall()
 
         FileUtil.mergeFilesByClass(self.model_id, from_list, G.classifiedFilePath)
-        self.__buildRcModels(range(len(self.categories[1])))
+        self.__buildRcModels(range(self.categories.shape[0]))
 
     #  插入或更新合并文件分类表
     def __dbUdFilesMerged(self, cursor, file_fullnames, results):
@@ -394,7 +388,7 @@ class FileClassifier(object):
                 RecordClassifier(files)
             except Exception as err:
                 errors += 1
-                G.log.error('ignored due to: %s', str(err))
+                G.log.debug('ignored due to: %s', str(err))
                 continue
         G.log.info('rc model built, %d failed.', errors)
 
@@ -421,7 +415,7 @@ class FileClassifier(object):
             return
         vectors = self.__buildVectors(corpus, len(corpus))
         # 预测类别并更新数据库
-        c_ids, confidences, distances = FileUtil.predict(self.model, self.categories[1], self.categories[2], vectors)
+        c_ids, confidences, distances = FileUtil.predict(self.model, self.categories[:, 1:3], vectors)
         with Dbc() as cursor:
             self.__dbUdFilesMerged(cursor, file_fullnames, (c_ids, confidences, distances))
             # 计算采集表更更新数据库
