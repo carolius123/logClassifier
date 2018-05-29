@@ -10,12 +10,10 @@ import os
 import re
 import shutil
 import tarfile
-from collections import Counter
 
 import numpy as np
 import pandas as pd
 import pymysql
-from scipy.signal import argrelextrema
 from sklearn.cluster import KMeans
 
 from anchor import Anchor
@@ -24,8 +22,8 @@ from config import Workspaces as G
 
 class Dbc(object):
 
-    def __init__(self):
-        self.conn = DbUtil.dbConnect()
+    def __init__(self, autocommit=False):
+        self.conn = DbUtil.dbConnect(autocommit)
         self.cursor = self.conn.cursor()
 
     def __enter__(self):
@@ -188,92 +186,24 @@ class FileUtil(object):
 
         # 合并返回单词列表
         return keep_words + k_shingles
-    # 聚类，得到各簇SSE（sum of the squared errors)，作为手肘法评估确定ｋ的依据
-    @staticmethod
-    def pilotClustering(classifier_section_name, vectors, k_from=1):
-        pilot_list = []  # [(k_, inertia, criterion, top5_percent)] criteria取inertia变化率的一阶微分的极大值
-        norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度标准化因子，保证不同向量的可比性
-        termination_inertia = G.cfg.getfloat(classifier_section_name, 'NormalizedTerminationInertia') * norm_factor
-        k_to = G.cfg.getint(classifier_section_name, 'MaxCategory')
-        for k_ in range(k_from, k_to):
-            kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
-            if k_ < k_from + 2:
-                pilot_list.append([k_, kmeans.inertia_, 0, 0, 0])
-                continue
-
-            for retry in range(5):  # 如果inertia因误差变大，重新聚几次
-                inertia = kmeans.inertia_
-                if inertia <= pilot_list[-1][1]:
-                    break
-                G.log.debug('retries=%d, inertia=%e', retry + 1, inertia)
-                kmeans = KMeans(n_clusters=k_).fit(vectors)
-            else:
-                inertia = pilot_list[-1][1]
-
-            pilot_list[-1][2] = pilot_list[-2][1] / pilot_list[-1][1] - pilot_list[-1][1] / inertia
-            G.log.info('pilot clustering. (k,inertia,criteria,top5)=\t%d\t%e\t%.3f\t%.3f', pilot_list[-1][0],
-                       pilot_list[-1][1], pilot_list[-1][2], pilot_list[-1][3])
-
-            top5_percent = sum([v for (k, v) in Counter(kmeans.labels_).most_common(5)]) / len(kmeans.labels_)
-            #             bad_percent = FileUtil.__getBadPointPercents(kmeans,vectors,cfg_q, k_)  # 作用不大,太慢
-            bad_percent = 0
-            pilot_list.append([k_, inertia, None, top5_percent, bad_percent])
-            if inertia < termination_inertia:  # 已经收敛到很小且找到可选值，没必要继续增加
-                if pilot_list[-2][1] > termination_inertia * 100:
-                    G.log.info('pilot-cluster finished. preferred k=%d[inertia from %e reduced to %e suddenly]', k_,
-                               pilot_list[-2][1], inertia)
-                    return k_
-                break
-
-        pilot_array = np.array(pilot_list)[1:-1, :]  # 去掉第一个和最后一个没法计算criterion值的
-        pilot_array = pilot_array[pilot_array[:, 3] < G.cfg.getfloat(classifier_section_name, 'Top5Ratio')]
-        pilot_array = pilot_array[argrelextrema(pilot_array[:, 2], np.greater)]  # 得到极大值
-        criteria = pilot_array[:, 2].tolist()
-        if not criteria:  # 没有极值
-            return pilot_list[-1][0]
-
-        max_top_n, idx_ = [], 0
-        while criteria[idx_:]:
-            idx_ = criteria.index(max(criteria[idx_:]))
-            max_top_n.append(pilot_array[idx_])
-            idx_ += 1
-        G.log.debug('topN k=\n%s',
-                    '\n'.join(['%d\t%e\t%.3f\t%.3f\t%.3f' % (k, i, c, t, b) for k, i, c, t, b in max_top_n]))
-        products = [k * c for k, i, c, t, b in max_top_n]
-        idx_ = products.index(max(products))
-        preferred = max_top_n[idx_][0]
-        G.log.info('pilot-cluster finished. preferred k=%d', preferred)
-        return preferred
-
-    @staticmethod
-    # 计算距离特别远（0.8分位点2倍距离以上）的坏点比例
-    def __getBadPointPercents(kmeans, vectors, cfg_q, k_):
-        v_scores = -np.array([kmeans.score([v]) for v in vectors])
-        groups = pd.DataFrame({'C': kmeans.labels_, 'S': v_scores}).groupby('C')
-        c_quantiles_double = 2 * np.array([groups.get_group(i)['S'].quantile(cfg_q) for i in range(k_)])
-        bad_samples = 0
-        for idx, score in enumerate(v_scores):
-            if score > c_quantiles_double[kmeans.labels_[idx]]:
-                bad_samples += 1
-        return bad_samples / len(v_scores)
 
     # 重新聚类，得到各Cluster的中心点、分位点距离、边界距离以及数量占比等
     @staticmethod
-    def buildModel(cfg_section, k_, vectors):
+    def buildModel(caller, k_, vectors):
         norm_factor = - vectors.shape[1]  # 按字典宽度归一化
         kmeans = KMeans(n_clusters=k_, n_init=20, max_iter=500).fit(vectors)
         scores = np.array([kmeans.score([v]) / norm_factor for v in vectors])
         groups = pd.DataFrame({'C': kmeans.labels_, 'S': scores}).groupby('C')
         # 计算结果各类的0.8分位点和边界距离
-        quantile = G.cfg.getfloat(cfg_section, 'Quantile')
-        quantiles = np.array([groups.get_group(i)['S'].quantile(quantile, interpolation='higher') for i in range(k_)])
+        quantiles = np.array(
+            [groups.get_group(i)['S'].quantile(caller.Quantile, interpolation='higher') for i in range(k_)])
         boundaries = groups['S'].agg('max').values  # 该簇中最远点距离
         double_quantiles = quantiles * 2
         boundaries[boundaries > double_quantiles] = double_quantiles[boundaries > double_quantiles]  # 边界太远的话，修正一下
         quantiles = boundaries - quantiles
         # 计算结果各类的向量数量和坏点数量(离中心太远)
         total_points = groups.size()
-        min_distances = boundaries - quantiles * G.cfg.getfloat(cfg_section, 'MinConfidence')
+        min_distances = boundaries - quantiles * caller.MinConfidence
         bad_points = []
         for label, group_ in groups:
             distances = np.array(group_['S'])
@@ -329,7 +259,7 @@ class FileUtil(object):
                 if fp_to:
                     fp_to.close()
                     result_files.append(file_to)
-                file_to = os.path.join(path_to, 'fc%d-%d' % (model_id, next_id))  # 文件命名规则后续逻辑使用
+                file_to = os.path.join(path_to, 'fc%d-%d.samples' % (model_id, next_id))  # 文件命名规则后续逻辑使用
                 fp_to = open(file_to, 'wb')
                 prev_id = next_id
                 c[2] += 1
@@ -372,11 +302,11 @@ class FileUtil(object):
 class DbUtil(object):
     # 连接数据库
     @classmethod
-    def dbConnect(cls):
+    def dbConnect(cls, autocommit=False):
         type_, host, usr, password, database = G.cfg.get('General', 'db').split(':')
         try:
             if type_ == 'mysql':
-                db = pymysql.connect(host, usr, password, database, charset='utf8')
+                db = pymysql.connect(host, usr, password, database, charset='utf8', autocommit=autocommit)
                 return db
             else:
                 return None

@@ -9,10 +9,14 @@
 import os
 import re
 import shutil
+from collections import Counter
 
 import numpy as np
 from gensim.corpora import Dictionary
 from gensim.models import TfidfModel
+from pandas import DataFrame
+from scipy.signal import argrelextrema
+from sklearn.cluster import KMeans
 from sklearn.externals import joblib
 
 from RecordClassifier import RecordClassifier
@@ -30,7 +34,12 @@ class FileClassifier(object):
     __ClassName = 'FileClassifier'
     maxClassifyLines = G.cfg.getint(__ClassName, 'MaxLines')
     maxFcModels = G.cfg.getint(__ClassName, 'MaxModels')
-    minFileConfidence = G.cfg.getfloat(__ClassName, 'MinConfidence')
+    MinConfidence = G.cfg.getfloat(__ClassName, 'MinConfidence')
+    Quantile = G.cfg.getfloat(__ClassName, 'Quantile')  # 类别的边界，该类中以该值为分位数的点，作为该类的边界
+
+    __MaxCategory = G.cfg.getint(__ClassName, 'MaxCategory')  # 尝试聚类的最大类别，以降低计算量
+    __NormalizedTerminationInertia = G.cfg.getfloat(__ClassName, 'NormalizedTerminationInertia')
+    __Top5Ratio = G.cfg.getfloat(__ClassName, 'Top5Ratio')
 
     def __init__(self, model_id, model_file_or_samples_path):
         self.ruleSet = None  # 处理文件正则表达式
@@ -40,30 +49,21 @@ class FileClassifier(object):
         self.categories = None  # 聚类的类型[[数量占比，分位点距离，边界点距离]]
 
         self.model_id = model_id
-        self.model_path = os.path.join(G.modelPath, str(self.model_id))
-        if not os.path.exists(self.model_path):
-            os.mkdir(self.model_path)
-        self.common_filenames, self.l1_structure = ([], [])
+        self.__model_path = os.path.join(G.modelPath, str(self.model_id))
+        if not os.path.exists(self.__model_path):
+            os.mkdir(self.__model_path)
+        self.__common_filenames, self.__comm_file_structure = ([], [])
 
         if os.path.isfile(model_file_or_samples_path):  # 从模型文件装载模型
             model_file = model_file_or_samples_path
             self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories = joblib.load(model_file)
             self.__dbRebuildCategories()
         elif os.path.isdir(model_file_or_samples_path):
-            self.corpusCacheFile = os.path.join(self.model_path, 'corpuscache.1')
-            self.corpusDescriptionFile = os.path.join(self.model_path, 'metadata.1')
+            self.corpusCacheFile = os.path.join(self.__model_path, 'corpuscache.1')
+            self.corpusDescriptionFile = os.path.join(self.__model_path, 'metadata.1')
             self.buildModel(model_file_or_samples_path)
         else:
             raise UserWarning('No valid model file or samples path!')
-
-    # 更新数据库中相关记录
-    def __dbRebuildCategories(self):
-        with Dbc() as cursor:
-            cursor.execute('DELETE FROM file_class WHERE model_id=%d' % self.model_id)
-            header = 'file_class:model_id, name, category_id, boundary, quantile, total_docs, bad_docs'
-            names = [[self.model_id, 'fc%d' % c_id] for c_id in self.categories[:, 0]]
-            dataset = np.hstack((names, self.categories))
-            DbUtil.dbInsert(cursor, header, dataset, update=False)
 
     # 训练、生成模型并保存在$model/xxx.mdl中,dataset:绝对/相对路径样本文件名，或者可迭代样本字符流
     def buildModel(self, from_path, k_=0):
@@ -85,18 +85,18 @@ class FileClassifier(object):
                 vectors = self.__buildVectors(corpus_cache_fp, self.dictionary.num_docs)  # 建立稀疏矩阵doc*(dct + stats)
                 corpus_cache_fp.close()  # 关闭缓存文件
                 start_k = min(50, int(vectors.shape[0] / 100))
-                k_ = k_ if k_ else FileUtil.pilotClustering(self.__ClassName, vectors, start_k)  # 多个K值试聚类，返回最佳K
+                k_ = k_ if k_ else self.__pilotClustering(vectors, start_k)  # 多个K值试聚类，返回最佳K
                 if k_ != 0:  # 找到合适的K，跳出循环
                     break
                 self.__clearCache()  # 清除缓存的corpus_cache_file
             else:
                 raise UserWarning('Cannot generate qualified corpus by all RuleSets')
         except UserWarning:
-            shutil.rmtree(self.model_path)
+            shutil.rmtree(self.__model_path)
             raise
 
         # 重新聚类, 得到模型(向量数、中心点和距离）和分类(向量-所属类)
-        self.model, self.categories = FileUtil.buildModel(self.__ClassName, k_, vectors)
+        self.model, self.categories = FileUtil.buildModel(self, k_, vectors)
         # 保存模型文件和数据库
         self.__saveModel()  # model saved to file
         self.__postProcess(vectors)
@@ -109,10 +109,10 @@ class FileClassifier(object):
         cache_fp = open(self.corpusCacheFile, mode='a+t', encoding='utf-8')  # 创建或打开语料缓存文件
         if cache_fp.tell() != 0:
             if os.path.exists(self.corpusDescriptionFile):
-                self.ruleSet, self.common_filenames, self.l1_structure, self.statsScope = joblib.load(
+                self.ruleSet, self.__common_filenames, self.__comm_file_structure, self.statsScope = joblib.load(
                     self.corpusDescriptionFile)
             cache_fp.seek(0)
-            cached_documents = len(self.common_filenames)
+            cached_documents = len(self.__common_filenames)
             for lines, line_ in enumerate(cache_fp):
                 if lines < cached_documents:
                     self.dictionary.add_documents([line_.split()])
@@ -137,10 +137,10 @@ class FileClassifier(object):
         G.log.info('Dictionary built with [%s](%d tokens, reduced from %d), from %d files( %d words)',
                    self.ruleSet[0], len(self.dictionary), num_token, self.dictionary.num_docs, self.dictionary.num_pos)
 
-        statistics = np.array(self.l1_structure)[:, 1:7]
+        statistics = np.array(self.__comm_file_structure)[:, 1:7]
         statistics[statistics > 500] = 500  # 防止异常大的数干扰效果
         self.statsScope = np.min(statistics, axis=0), np.max(statistics, axis=0)
-        joblib.dump((self.ruleSet, self.common_filenames, self.l1_structure, self.statsScope),
+        joblib.dump((self.ruleSet, self.__common_filenames, self.__comm_file_structure, self.statsScope),
                     self.corpusDescriptionFile)
 
         return cache_fp
@@ -149,7 +149,7 @@ class FileClassifier(object):
     def __buildDocument(self, dataset_path):
         amount_files, failed_files, file_fullname = 0, 0, ''
         G.log.info('Start Converting documents from ' + dataset_path)
-        processed_files = os.path.join(self.model_path, 'buildDocument.dbf')
+        processed_files = os.path.join(self.__model_path, 'buildDocument.dbf')
         processed = [] if not os.path.exists(processed_files) else joblib.load(processed_files)
         with Dbc() as cursor:
             for dir_path, dir_names, file_names in os.walk(dataset_path):
@@ -206,8 +206,8 @@ class FileClassifier(object):
         stats = [np.mean(lc), np.mean(lw), np.std(lc), np.std(lw), np.median(lc), np.median(lw)]
         doc_structure = [line_idx] + stats + subtotal_chars + subtotal_words
         # 汇总和保持元数据
-        self.common_filenames.append(file_fullname)
-        self.l1_structure.append(doc_structure)
+        self.__common_filenames.append(file_fullname)
+        self.__comm_file_structure.append(doc_structure)
         return document
 
     # 从词表和文档结构形成聚类向量
@@ -224,7 +224,7 @@ class FileClassifier(object):
                 vectors[doc_idx, word_idx] = tf_idf_value  # tfidf词表加入向量
 
         # 按每个文档的行数对tfidf向量进行标准化，保证文档之间的可比性
-        l1_fd = np.array(self.l1_structure)[-rows:, :]  # [[行数, 均值/标准差/中位数,字节和字数的12个分段数量比例]]
+        l1_fd = np.array(self.__comm_file_structure)[-rows:, :]  # [[行数, 均值/标准差/中位数,字节和字数的12个分段数量比例]]
 
         lines = l1_fd[:, 0:1]
         vectors /= lines
@@ -236,39 +236,119 @@ class FileClassifier(object):
         statistics = (statistics - min_) / (max_ - min_) * 0.01  # 6列统计值各占1%左右权重
         subtotal = l1_fd[:, 7:] * 0.005  # subtotal 12列各占0.5%左右权重
 
-        cols += len(self.l1_structure[0])
+        cols += len(self.__comm_file_structure[0])
         if rows > 300:  # predict时经常一个文件做一次,没有必要记log
             G.log.info('[%d*%d]Vectors built' % (rows, cols))
 
         return np.hstack((statistics, subtotal, vectors))
 
+    # 聚类，得到各簇SSE（sum of the squared errors)，作为手肘法评估确定ｋ的依据
+    def __pilotClustering(self, vectors, k_from=1):
+        pilot_list = []  # [(k_, inertia, criterion, top5_percent)] criteria取inertia变化率的一阶微分的极大值
+        norm_factor = vectors.shape[1] * vectors.shape[0]  # 按行/样本数和列/字典宽度标准化因子，保证不同向量的可比性
+        termination_inertia = self.__NormalizedTerminationInertia * norm_factor
+        for k_ in range(k_from, self.__MaxCategory):
+            kmeans = KMeans(n_clusters=k_, tol=1e-5).fit(vectors)  # 试聚类
+            if k_ < k_from + 2:
+                pilot_list.append([k_, kmeans.inertia_, 0, 0, 0])
+                continue
+
+            for retry in range(5):  # 如果inertia因误差变大，重新聚几次
+                inertia = kmeans.inertia_
+                if inertia <= pilot_list[-1][1]:
+                    break
+                G.log.debug('retries=%d, inertia=%e', retry + 1, inertia)
+                kmeans = KMeans(n_clusters=k_).fit(vectors)
+            else:
+                inertia = pilot_list[-1][1]
+
+            pilot_list[-1][2] = pilot_list[-2][1] / pilot_list[-1][1] - pilot_list[-1][1] / inertia
+            G.log.info('pilot clustering. (k,inertia,criteria,top5)=\t%d\t%e\t%.3f\t%.3f', pilot_list[-1][0],
+                       pilot_list[-1][1], pilot_list[-1][2], pilot_list[-1][3])
+
+            top5_percent = sum([v for (k, v) in Counter(kmeans.labels_).most_common(5)]) / len(kmeans.labels_)
+            #             bad_percent = FileUtil.__getBadPointPercents(kmeans,vectors,cfg_q, k_)  # 作用不大,太慢
+            bad_percent = 0
+            pilot_list.append([k_, inertia, None, top5_percent, bad_percent])
+            if inertia < termination_inertia:  # 已经收敛到很小且找到可选值，没必要继续增加
+                if pilot_list[-2][1] > termination_inertia * 100:
+                    G.log.info('pilot-cluster finished. preferred k=%d[inertia from %e reduced to %e suddenly]', k_,
+                               pilot_list[-2][1], inertia)
+                    return k_
+                break
+
+        pilot_array = np.array(pilot_list)[1:-1, :]  # 去掉第一个和最后一个没法计算criterion值的
+        pilot_array = pilot_array[pilot_array[:, 3] < self.__Top5Ratio]
+        pilot_array = pilot_array[argrelextrema(pilot_array[:, 2], np.greater)]  # 得到极大值
+        criteria = pilot_array[:, 2].tolist()
+        if not criteria:  # 没有极值
+            return pilot_list[-1][0]
+
+        max_top_n, idx_ = [], 0
+        while criteria[idx_:]:
+            idx_ = criteria.index(max(criteria[idx_:]))
+            max_top_n.append(pilot_array[idx_])
+            idx_ += 1
+        G.log.debug('topN k=\n%s',
+                    '\n'.join(['%d\t%e\t%.3f\t%.3f\t%.3f' % (k, i, c, t, b) for k, i, c, t, b in max_top_n]))
+        products = [k * c for k, i, c, t, b in max_top_n]
+        idx_ = products.index(max(products))
+        preferred = max_top_n[idx_][0]
+        G.log.info('pilot-cluster finished. preferred k=%d', preferred)
+        return preferred
+
+    @staticmethod
+    # 计算距离特别远（0.8分位点2倍距离以上）的坏点比例
+    def __getBadPointPercents(kmeans, vectors, cfg_q, k_):
+        v_scores = -np.array([kmeans.score([v]) for v in vectors])
+        groups = DataFrame({'C': kmeans.labels_, 'S': v_scores}).groupby('C')
+        c_quantiles_double = 2 * np.array([groups.get_group(i)['S'].quantile(cfg_q) for i in range(k_)])
+        bad_samples = 0
+        for idx, score in enumerate(v_scores):
+            if score > c_quantiles_double[kmeans.labels_[idx]]:
+                bad_samples += 1
+        return bad_samples / len(v_scores)
+
     # 保存模型到G.projectFileClassifierModel
     def __saveModel(self):
-        model_file = os.path.join(self.model_path, 'FileClassifier.Model')
+        model_file = os.path.join(self.__model_path, 'FileClassifier.Model')
         joblib.dump((self.ruleSet, self.dictionary, self.statsScope, self.model, self.categories), model_file)
-        self.__dbRebuildCategories()
+        self.__dbRebuildCategories(update=True)
         self.dictionary.save_as_text(os.path.join(G.logsPath, 'FileDictionary.csv'))
         G.log.info('Model is built and saved to %s successful.', model_file)
+
+    # 更新数据库中相关记录
+    def __dbRebuildCategories(self, update=False):
+        with Dbc() as cursor:
+            if not update:
+                cursor.execute('SELECT COUNT(model_id) FROM file_class WHERE model_id=%d' % self.model_id)
+                if cursor.fetchone()[0]:
+                    return
+            cursor.execute('DELETE FROM file_class WHERE model_id=%d' % self.model_id)
+            header = 'file_class:model_id, name, category_id, boundary, quantile, total_docs, bad_docs'
+            names = [[self.model_id, 'fc%d' % c_id] for c_id in self.categories[:, 0]]
+            dataset = np.hstack((names, self.categories))
+            DbUtil.dbInsert(cursor, header, dataset, update=False)
 
     def __postProcess(self, vectors):
         results = FileUtil.predict(self.model, self.categories[:, 1:3], vectors)
         with Dbc() as cursor:
-            self.__dbUdFilesMerged(cursor, self.common_filenames, results)
+            self.__dbUdFilesMerged(cursor, self.__common_filenames, results)
             self.__updLogFlows(cursor)  # 生成采集文件列表
             # 同类文件合并到to_目录下
             sql = 'SELECT category_id, file_fullname FROM files_classified WHERE model_id=%d AND confidence>=%f ORDER BY category_id' % (
-            self.model_id, self.minFileConfidence)
+                self.model_id, self.MinConfidence)
             cursor.execute(sql)
             from_list = cursor.fetchall()
 
         FileUtil.mergeFilesByClass(self.model_id, from_list, G.classifiedFilePath)
-        self.__buildRcModels(range(self.categories.shape[0]))
+        self.buildRcModels(range(self.categories.shape[0]))
 
     #  插入或更新合并文件分类表
     def __dbUdFilesMerged(self, cursor, file_fullnames, results):
         dataset = []
         for f_name, c_id, con, dis in zip(file_fullnames, results[0], results[1], results[2]):
-            if con < self.minFileConfidence:  # 置信度不够,未完成分类
+            if con < self.MinConfidence:  # 置信度不够,未完成分类
                 model_id, c_id = None, None
             else:
                 model_id = self.model_id
@@ -312,7 +392,7 @@ class FileClassifier(object):
     @staticmethod
     def __querySamples(cursor, additional_where):
         sql = 'SELECT model_id,category_id, host, remote_path, filename, common_name,anchor_name, anchor_start_col, anchor_end_col,last_collect,last_update FROM files_classified WHERE confidence >= %f %s ORDER BY model_id, category_id, host, remote_path' % (
-        FileClassifier.minFileConfidence, additional_where)
+            FileClassifier.MinConfidence, additional_where)
         cursor.execute(sql)
         return cursor.fetchall()
 
@@ -377,14 +457,14 @@ class FileClassifier(object):
                 break
         return shortest[:i] + '*'
 
-    def __buildRcModels(self, fc_list):
+    def buildRcModels(self, fc_list):
         errors = 0
         for fc_id in fc_list:
             try:
-                prefix = 'fc%d-%d' % (self.model_id, fc_id)
-                G.log.info('Record classifying [%s]...', prefix)
+                G.log.info('Record classifying [fc%d-%d]...', self.model_id, fc_id)
                 files = sorted([os.path.join(G.classifiedFilePath, filename)
-                                for filename in os.listdir(G.classifiedFilePath) if filename[:len(prefix)] == prefix])
+                                for filename in os.listdir(G.classifiedFilePath)
+                                if re.match('fc%d-%d\D' % (self.model_id, fc_id), filename)])
                 RecordClassifier(files)
             except Exception as err:
                 errors += 1
@@ -423,7 +503,7 @@ class FileClassifier(object):
             where_clause = ' AND common_name in (%s)' % ','.join(where_clause)
             self.__updLogFlows(cursor, where_clause)  # 生成采集文件列表并更新日志流配置
         classified = '","'.join([file_fullname.replace('\\', '/') for file_fullname, confidence
-                                 in zip(file_fullnames, confidences) if confidence >= self.minFileConfidence])
+                                 in zip(file_fullnames, confidences) if confidence >= self.MinConfidence])
         # 分类文件存储到已分类目录, 为日志记录分类储备数据
         if classified:
             with Dbc() as cursor:
@@ -435,10 +515,10 @@ class FileClassifier(object):
                 file_fullname_to = os.path.join(G.classifiedFilePath, 'fc%d-%d-%d' % (self.model_id, category_id, id_))
                 shutil.copy(common_name, file_fullname_to)
                 fc_ids.add(category_id)
-            self.__buildRcModels(fc_ids)
+            self.buildRcModels(fc_ids)
 
         unclassified = [file_fullname for file_fullname, confidence
-                        in zip(file_fullnames, confidences) if confidence < self.minFileConfidence]
+                        in zip(file_fullnames, confidences) if confidence < self.MinConfidence]
         return unclassified
 
     # 删除缓存文件

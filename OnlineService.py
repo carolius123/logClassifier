@@ -48,9 +48,9 @@ class OnlineService(object):
 
         flow_id, flow_status = self.getFlowID(source_id, host, path, wildcard_name)
         self.logFlowThread(flow_id, source_id, flow_status, data_flow)
-        # t = threading.Thread(target=self.logFlowThread, args=(flow_id, source_id, flow_status, data_flow))
-        # self.threads[source_id] = t
-        # t.start()
+        t = threading.Thread(target=self.logFlowThread, args=(flow_id, source_id, flow_status, data_flow))
+        self.threads[source_id] = t
+        t.start()
 
     # 检查该流的处理线程是否活着
     def __threadExist(self, source_id):
@@ -219,4 +219,7 @@ class OnlineService(object):
 if __name__ == '__main__':
     ols = OnlineService()
 
-    # ols.dispatcher('abd', open('D:\\home\\suihf\\data\\fc0-4', 'r', encoding='utf-8'))
+    ols.dispatcher('abd', open('D:\\home\\suihf\\data\\fc0-4.samples', 'r', encoding='utf-8'))
+    ols.dispatcher('1', open('D:\\home\\suihf\\data\\fc0-1.samples', 'r', encoding='utf-8'))
+    ols.dispatcher('2', open('D:\\home\\suihf\\data\\fc0-2.samples', 'r', encoding='utf-8'))
+    ols.dispatcher('3', open('D:\\home\\suihf\\data\\fc0-3.samples', 'r', encoding='utf-8'))
