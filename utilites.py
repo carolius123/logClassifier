@@ -234,7 +234,7 @@ class FileUtil(object):
             distances.append(distance)
             category = predicted_labels[i]
             confidence = model_quantiles[category, 0] - distance
-            if model_quantiles[category, 1]:
+            if model_quantiles[category, 1]:  # 分位距不等于边界距
                 confidence /= model_quantiles[category, 1]
             else:
                 confidence /= 1e-100

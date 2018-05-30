@@ -38,23 +38,9 @@ class Workspaces(object):
         if not os.path.exists(__folder):
             os.mkdir(__folder)
 
-    timeMargin = cfg.getint('General', 'TimeMargin')
-    dateMargin = cfg.getint('General', 'DateMargin')
+    anchorTimeMargin = cfg.getint('General', 'AnchorTimeMargin')
+    anchorDateMargin = cfg.getint('General', 'AnchorDateMargin')
     last_update_seconds = cfg.getint('General', 'LastUpdateHours') * 3600
-    '''
-    采集的压缩文件中包含的fileDescriptor文件保存如下列表: [[l0_filenames], [fd_origin], [fd_common], [fd_category]].
-        l0_filenames 是$l0_input中所有文件全路径名列表, 目录分割符为/
-        fd_origin = [ori_name, gather_time, last_update_time, ori_size] 在被管服务器上的全路径名,采集时间等
-        fd_common = [common_name, anchor] 在$l1_cache中全路径名(去掉数字后合并的文件)
-        fd_category = [category_name, confidences, distances] 分类, 置信度和中心距离
-    '''
-    # fileDescriptor = os.path.join(projectModelPath, 'FileDescriptor.dbf')  # 样本文件描述信息
-    # fd_origin_none = ['', 0, -last_update_seconds * 2, 0]  # [ori_name, gather_time, last_update_time, ori_size]
-    # fd_common_none = ['', '']  # [common_name, anchor]
-    # fd_category_none = ['', 0, 0]  # [category_name, confidences, distances]
-
-    # productFileClassifierModel = os.path.join(productModelPath, 'FileClassifier.Model')
-    # projectFileClassifierModel = os.path.join(projectModelPath, 'FileClassifier.Model')
     fileMergePattern = re.compile(cfg.get('General', 'FileMergePattern'))
     fileCheckPattern = re.compile(cfg.get('General', 'FileCheckPattern'))
 

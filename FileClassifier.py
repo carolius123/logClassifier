@@ -470,7 +470,7 @@ class FileClassifier(object):
                 errors += 1
                 G.log.debug('ignored due to: %s', str(err))
                 continue
-        G.log.info('rc model built, %d failed.', errors)
+        G.log.info('%d rc model built, %d failed.', len(fc_list) - errors, errors)
 
     # 对多个样本文件列表进行分类预测
     def predict(self, file_fullnames, encoding='utf-8'):

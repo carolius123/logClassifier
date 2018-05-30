@@ -142,8 +142,8 @@ class Anchor(object):
         """
         (start_, name_), (amount_, dec_counter, stop_, last_time) = anchor
         # 考虑时间戳前后可能有变长变量(如INFO，CRITICAL等），给起止位置留一定余量(前后5个字符）
-        self.colSpan = (0 if 0 <= start_ < G.timeMargin else start_ - G.timeMargin,
-                        0 if -G.timeMargin <= stop_ < 0 else stop_ + G.timeMargin)
+        self.colSpan = (0 if 0 <= start_ < G.anchorTimeMargin else start_ - G.anchorTimeMargin,
+                        0 if -G.anchorTimeMargin <= stop_ < 0 else stop_ + G.anchorTimeMargin)
         self.name = name_  # 设置正则表达式名称
         self.timeRegExp = re.compile('(%s)' % self.__TimeSpecs[name_], re.I)  # 设置正则表达式
 
@@ -171,16 +171,16 @@ class Anchor(object):
         line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex) + ',', line)
         line = re.sub(r'[年月日]|, ', '-', line)
 
-        start_col = base_col + time_span[0] - G.dateMargin
+        start_col = base_col + time_span[0] - G.anchorDateMargin
         start_col = 0 if start_col < 0 else start_col
 
-        match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.dateMargin])
+        match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.anchorDateMargin])
 
         if match_:
             left[True] += 1
         else:
             start_col = base_col + time_span[1]
-            match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.dateMargin])
+            match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.anchorDateMargin])
             if match_:
                 left[False] += 1
 
@@ -272,6 +272,37 @@ class Anchor(object):
         return ymd_mask
 
     # 返回锚点的日期时间值
+    def removeDateTime(self, line):
+        if not self.timeRegExp:
+            raise UserWarning('Failed to getAnchorTimeStamp: Anchor is not initialized!')
+        base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
+        time_ = self.timeRegExp.search(line[self.colSpan[0]:self.colSpan[1]])
+        if not time_:  # 没有搜到有效的时间戳
+            return line
+        start_ = base_col + time_.start()
+        end_ = base_col + time_.end()
+
+        if self.name == 'COLON' and self.datePattern:
+            line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex) + ',', line)
+            line = re.sub(r'[年月日]|, ', '-', line)
+            start_col = start_ - G.anchorDateMargin if self.datePattern['left'] else end_
+            start_col = 0 if start_col < 0 else start_col
+            match_ = self.dateRegExp.search(line[start_col:start_col + G.anchorDateMargin])
+            if match_:
+                if self.datePattern['left']:
+                    start_ = start_col + match_.start()
+                else:
+                    end_ = start_col + match_.end()
+        elif self.name == 'HHMMSS':
+            start_col = start_ - 10
+            start_col = 0 if start_col < 0 else start_col
+            match_ = self.__DigitalDateRegex.search(line[start_col:start_col + 10])
+            if match_:
+                start_ = start_col + match_.start()
+        line = line[:start_] + line[end_:]
+        return line
+
+    # 返回锚点的日期时间值
     def getTimeStamp(self, line):
         """
         返回锚点的时间戳值，如不存在，返回None
@@ -320,9 +351,10 @@ class Anchor(object):
         line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex) + ',', line)
         line = re.sub(r'[年月日]|, ', '-', line)
 
-        start_col = base_col + time_span[0] - G.dateMargin if self.datePattern['left'] else base_col + time_span[1]
+        start_col = base_col + time_span[0] - G.anchorDateMargin if self.datePattern['left'] else base_col + time_span[
+            1]
         start_col = 0 if start_col < 0 else start_col
-        match_ = self.dateRegExp.search(line[start_col:start_col + G.dateMargin])
+        match_ = self.dateRegExp.search(line[start_col:start_col + G.anchorDateMargin])
         if not match_:
             return None
         matches = match_.groups()

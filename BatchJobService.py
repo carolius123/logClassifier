@@ -34,7 +34,14 @@ class BatchJobService(object):
 
         threading.Timer(self.interval, self.run).start()
 
+    # 对上传的新类型文件进行分类, 生成采集列表
     def classifyNewLogs(self):
+        """
+        $transitPath/*.tar.gz -> 解压 -> 合并 -> 滤除已知文件 -> 新文件分类预测 -> 生成采集列表
+            -> 无法分类的,积累在$mergedFilePath
+            -> 分类成功,记录分类模型尚未形成的, 记录模型聚类 -> 生成指标模型
+        :return: 无
+        """
         G.log.info('Extracting files from %s to %s', G.transitPath, G.inboxPath)
         for tar_file in os.listdir(G.transitPath):
             if not tar_file.endswith('.tar.gz'):
@@ -98,7 +105,8 @@ class BatchJobService(object):
     def buildModel(self, model_id=None, re_merge=False):
         """
         系统积累了一定量的无法通过产品内置模型分类的样本, 或者产品模型升级后, 重新聚类形成现场模型.
-        清理以前的现场数据 -> 重新合并原始样本->采用内置产品模型分类 -> 日志文件模型聚类 -> 日志记录模型聚类 -> 重新计算基线
+        清理以前数据 -> 重新合并原始样本->采用内置产品模型分类 -> 日志文件模型聚类 -> 生成采集列表 - >日志记录模型聚类
+         -> 生成指标模型
         """
         if model_id is None:
             models = len([path for path in os.listdir(G.modelPath)
@@ -139,5 +147,5 @@ class BatchJobService(object):
 
 if __name__ == '__main__':
     bcs = BatchJobService()
-    bcs.buildModel(re_merge=True)
-    # bcs.run()
+    # bcs.buildModel()
+    bcs.run()
