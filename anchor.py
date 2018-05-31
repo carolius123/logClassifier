@@ -21,24 +21,17 @@ class Anchor(object):
     列的位置相对固定。
     """
     __TimeSep = [r'(:|Ê±|时|时-)', r'(:|·Ö|分|分-)']
-    __TimeIdx = {'COLON': (1, 3, 5, 6), 'SECONDS': (None, None, 1, None), 'HHMMSS': (1, 2, 3, None)}
+    __TimeIdx = {'COLON': (1, 3, 5, 7), 'SECONDS': (None, None, 1, None), 'HHMMSS': (1, 2, 3, None)}
     __TimeSpecs = {'COLON': '(\d+)' + __TimeSep[0] + r'(\d|[0-5]\d)' + __TimeSep[1]
-                            + r'(\d|[0-5]\d)([\.:,]\d{2,3})?(?!\d)',
+                            + r'(\d|[0-5]\d)([\.:,](\d{2,3}))?(?!\d)',
                    'SECONDS': r'(?<!\d)(15\d{8})\.\d+',
                    'HHMMSS': r'(?<!\d)([0-1]\d|2[0-3])([0-5]\d)([0-5]\d)(?!\d)'
                    }
     __TimeRegExp = re.compile('|'.join('(?P<%s>%s)' % (k_, v_) for k_, v_ in __TimeSpecs.items()), re.I)
     __MonthRegex = re.compile(r'(?<=\W)(Jan)|(Feb)|(Mar)|(Apr)|(May)|(Jun|June)|(Jul|July)|(Aug)|(Sep|Sept)'
                               r'|(Oct)|(Nov)|(Dec)(?=\W)', re.I)
-    __DateSep = r'[\\/-]'
-    __HyphenDateIdx = {'YYMMDD': (0, 2, 3), 'MMDD': (0, 1, None)}
-    __HyphenDateSpecs = {'YYMMDD': r'(?<!\d)(\d{1,4})(?P<sep>' + __DateSep + ')(\d{1,4})(?P=sep)(\d{1,4})(?!\d)',
-                         'MMDD': r'(?<!\d)([1-9]|[0-3]\d)' + __DateSep + '([1-9]|[0-3]\d)(?!\d)'
-                         }
-    __HyphenDateRegex = re.compile('|'.join('(?P<%s>%s)' % (k_, v_) for k_, v_ in __HyphenDateSpecs.items()), re.I)
-
     __DigitalDateRegex = re.compile(r'(?<!\d)((20)?([12]\d))?(0\d|1[012])([012]\d|3[01])(?!\d)')
-    __PmRegex = re.compile(r'(?<=[\d\s])(pm\s|下午)(?=[\d\s])', re.I)
+    __PmRegex = re.compile(r'(?<=[\d\s])(pm|下午)(?=[\d\s])', re.I)
 
     # 从sample file提取时间戳锚点，或者按anchor等参数设置时间戳锚点
     def __init__(self, sample_file=None, col_span=(0, None), name='COLON', probe_date=False):
@@ -87,7 +80,12 @@ class Anchor(object):
             start_ = match_.start() if i == 0 else match_.start() - len(line)  # start col position of first one
             stop_ = match_.end() if i == 0 else match_.end() - len(line)  # stop col position of first one
             inc_counter, dec_counter, stop_max, last_time = anchors.get((start_, regex_name), [0, 0, -30000, 0])
-            this_time = 0.
+
+            b = match_.groups()
+            a = match_.group().split(':')
+            if regex_name == 'COLON' and len(a) == 4 and len(a[3]) <= 2:  # 这种情况[28/Dec/2017:00:01:40 +0800]
+                base_idx += 2
+            millisecond = 0
             for idx, hms_offset in enumerate(cls.__TimeIdx[regex_name]):
                 if not hms_offset or not match_.group(base_idx + hms_offset):  # None不参与计算
                     value = '0'
@@ -96,17 +94,17 @@ class Anchor(object):
                 else:
                     value = match_.group(base_idx + hms_offset)
 
-                this_time += float(value)
+                millisecond += float(value)
                 if idx < 2:  # 时分
-                    this_time *= 60
+                    millisecond *= 60
                 elif idx == 2:  # 秒
-                    this_time *= 100
-            if this_time > last_time:
+                    millisecond *= 1000
+            if millisecond > last_time:
                 inc_counter += 1
-            elif this_time < last_time:
+            elif millisecond < last_time:
                 dec_counter += 1
 
-            anchors[(start_, regex_name)] = [inc_counter, dec_counter, max(stop_, stop_max), this_time]
+            anchors[(start_, regex_name)] = [inc_counter, dec_counter, max(stop_, stop_max), millisecond]
             if max(inc_counter, dec_counter) > 100:
                 return True
         return False
@@ -165,33 +163,35 @@ class Anchor(object):
         except Exception as err:
             G.log.warning('%s ignored due to the following error:%s', sample_file, str(err))
 
-    # 找带分隔符的日期, 兼容如下例子<Apr 8, 2017 8:51:28 AM CST>, [2017-12-31T15:32:30.255+08:00]
+    # 找带分隔符的日期,
     def __probeHyphenDate(self, time_span, line, results, left):
         base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
-        line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex) + ',', line)
-        line = re.sub(r'[年月日]|, ', '-', line)
-
-        start_col = base_col + time_span[0] - G.anchorDateMargin
+        end_col = base_col + time_span[0]
+        start_col = end_col - G.anchorDateMargin
         start_col = 0 if start_col < 0 else start_col
+        line = self.__MonthRegex.sub(lambda x: str(x.lastindex).rjust(len(x.group(x.lastindex))), line)
+        result = re.findall(r'\d{1,4}', line[start_col:end_col])
 
-        match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.anchorDateMargin])
-
-        if match_:
+        if result:
             left[True] += 1
+            result = result[-3:]
         else:
             start_col = base_col + time_span[1]
-            match_ = self.__HyphenDateRegex.search(line[start_col:start_col + G.anchorDateMargin])
-            if match_:
+            end_col = start_col + G.anchorDateMargin
+            result = re.findall(r'\d{1,4}', line[start_col:end_col])
+            if result:
                 left[False] += 1
+                result = result[:3]
 
-        if match_:
-            disordered_date = match_.group()
-            disordered_date = re.sub(self.__DateSep, '/', disordered_date)
-            results.add(disordered_date)
+        if not result or len([x for x in result if len(x) > 2]) > 1:  # 没有搜到或者格式不对
+            return
+
+        disordered_date = '/'.join(result)
+        results.add(disordered_date)
 
     def __setDatePattern(self, results, left):
         if not results:  # 没有搜到日期数据
-            self.datePattern = None
+            # self.datePattern = None
             return
 
         unordered_dates = np.array([[int(cell) for cell in row.split('/')] for row in list(results)])
@@ -202,11 +202,10 @@ class Anchor(object):
             date_name = 'MMDD'
         else:
             date_name = 'YYMMDD'
-        date_pattern = {v: Anchor.__HyphenDateIdx[date_name][idx] for idx, v in enumerate(ymd_mask)}
+        date_pattern = {v: idx for idx, v in enumerate(ymd_mask)}
         date_pattern['name'] = date_name
 
         self.datePattern.update(date_pattern)
-        self.dateRegExp = re.compile(self.__HyphenDateSpecs[self.datePattern['name']])
         self.datePattern['left'] = True if left[True] > left[False] else False
 
     # 确定年月日的顺序, 依据包括：日期变化规律、4位是年、大于2位年的是日、唯一大于12的是年，唯一小于12的是月
@@ -272,37 +271,6 @@ class Anchor(object):
         return ymd_mask
 
     # 返回锚点的日期时间值
-    def removeDateTime(self, line):
-        if not self.timeRegExp:
-            raise UserWarning('Failed to getAnchorTimeStamp: Anchor is not initialized!')
-        base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
-        time_ = self.timeRegExp.search(line[self.colSpan[0]:self.colSpan[1]])
-        if not time_:  # 没有搜到有效的时间戳
-            return line
-        start_ = base_col + time_.start()
-        end_ = base_col + time_.end()
-
-        if self.name == 'COLON' and self.datePattern:
-            line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex) + ',', line)
-            line = re.sub(r'[年月日]|, ', '-', line)
-            start_col = start_ - G.anchorDateMargin if self.datePattern['left'] else end_
-            start_col = 0 if start_col < 0 else start_col
-            match_ = self.dateRegExp.search(line[start_col:start_col + G.anchorDateMargin])
-            if match_:
-                if self.datePattern['left']:
-                    start_ = start_col + match_.start()
-                else:
-                    end_ = start_col + match_.end()
-        elif self.name == 'HHMMSS':
-            start_col = start_ - 10
-            start_col = 0 if start_col < 0 else start_col
-            match_ = self.__DigitalDateRegex.search(line[start_col:start_col + 10])
-            if match_:
-                start_ = start_col + match_.start()
-        line = line[:start_] + line[end_:]
-        return line
-
-    # 返回锚点的日期时间值
     def getTimeStamp(self, line):
         """
         返回锚点的时间戳值，如不存在，返回None
@@ -347,18 +315,18 @@ class Anchor(object):
 
     # 在时间左侧或者右侧搜索并提取以/\-等分隔的日期
     def __getHyphenDate(self, time_span, line):
-        base_col = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
-        line = self.__MonthRegex.sub(lambda match_obj: str(match_obj.lastindex) + ',', line)
-        line = re.sub(r'[年月日]|, ', '-', line)
-
-        start_col = base_col + time_span[0] - G.anchorDateMargin if self.datePattern['left'] else base_col + time_span[
-            1]
+        base_ = self.colSpan[0] if self.colSpan[0] >= 0 else self.colSpan[0] + len(line)
+        start_col = base_ + time_span[0] - G.anchorDateMargin if self.datePattern['left'] else base_ + time_span[1]
         start_col = 0 if start_col < 0 else start_col
-        match_ = self.dateRegExp.search(line[start_col:start_col + G.anchorDateMargin])
-        if not match_:
+        end_col = base_ + time_span[0] if self.datePattern['left'] else base_ + time_span[1] + G.anchorDateMargin
+
+        line = self.__MonthRegex.sub(lambda x: str(x.lastindex).rjust(len(x.group(x.lastindex))), line)
+        result = re.findall(r'\d{1,4}', line[start_col:end_col])
+        if not result:
             return None
-        matches = match_.groups()
-        mm, dd = int(matches[self.datePattern['m']]), int(matches[self.datePattern['d']])
+        result = result[-3:] if self.datePattern['left'] else result[:3]
+
+        mm, dd = int(result[self.datePattern['m']]), int(result[self.datePattern['d']])
         y = self.datePattern.get('y', None)
         if y is None:
             today = datetime.date.today()
@@ -366,7 +334,7 @@ class Anchor(object):
             if today.month * 100 + today.day < mm * 100 + dd:
                 yy -= 1
         else:
-            yy = int(matches[y])
+            yy = int(result[y])
             yy += 2000 if yy < 100 else 0
 
         anchor_date = datetime.date(yy, mm, dd)
@@ -426,7 +394,7 @@ if __name__ == '__main__':
 
 
     def run():
-        file_or_path = 'D:\\home\\suihf\\data\\classified\\fc0-67'
+        file_or_path = 'D:\\home\\t.txt'
         #            input('input a path or full file name:')
         if not file_or_path.strip():
             return False
@@ -449,7 +417,7 @@ if __name__ == '__main__':
         try:
             a = Anchor(file_fullname, probe_date=True)
             for line in open(file_fullname, 'r', encoding='utf-8'):
-                a.getTimeStamp(line)
+                b = a.getTimeStamp(line)
             G.log.info('%s\t%s\t%s\t%d' % (filename, file_fullname, a.name, a.colSpan[0]))
         except Exception as e:
             G.log.error('%s\t%s\tERROR\t%s' % (filename, file_fullname, str(e)))

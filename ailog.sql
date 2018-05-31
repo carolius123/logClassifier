@@ -1,3 +1,7 @@
+# noinspection SpellCheckingInspectionForFile
+
+# noinspection SpellCheckingInspectionForFile
+
 /*
 Navicat MySQL Data Transfer
 
